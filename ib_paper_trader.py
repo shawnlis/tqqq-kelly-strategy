@@ -398,13 +398,16 @@ def run_strategy_snapshot(mod, start_iso: str, end_iso: str,
         slip_bps=other.get("slip_bps", 1.5),
         impact_k=other.get("impact_k", 0.0005),
     )
+    initial_train_end = other.get("initial_train_end") or "2018-12-31"
+    initial_train_end = pd.Timestamp(initial_train_end).strftime("%Y-%m-%d")
+    print(f"[strategy] initial_train_end={initial_train_end}")
 
     backtest_fn = getattr(mod, "deep_learning_backtest", None)
     if backtest_fn is None:
         raise RuntimeError("Strategy module is missing deep_learning_backtest.")
     res = backtest_fn(
         df,
-        initial_train_end=other.get("initial_train_end"),
+        initial_train_end=initial_train_end,
         **common_kwargs,
     )
     weights_df = res[3]

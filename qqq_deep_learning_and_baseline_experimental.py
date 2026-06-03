@@ -1496,6 +1496,14 @@ def ma_crossover_backtest(df,
     }
     return equity, dd, report, weights_df, trades_df, t_eq, notes_df, positions_df, None, None
 # ------------------ DL-enhanced backtest with the same PolicyBrain hooks ------------------
+def validate_initial_train_end_for_dl(initial_train_end):
+    if initial_train_end is None:
+        raise ValueError(
+            "initial_train_end is required for DL backtests; refusing to train on the full df."
+        )
+    return pd.Timestamp(initial_train_end)
+
+
 def deep_learning_backtest(df,
                            rf_series=None,
                            rf_ann=0.02,
@@ -1535,6 +1543,7 @@ def deep_learning_backtest(df,
                            crash_mode="soft_scale",
                            crash_tail_frac=0.05):
 
+    initial_train_end_ts = validate_initial_train_end_for_dl(initial_train_end)
     crash_mode = (crash_mode or "soft_scale").lower()
     if crash_mode not in {"none", "monitor_only", "hard_cap", "soft_scale"}:
         crash_mode = "soft_scale"
@@ -1545,25 +1554,32 @@ def deep_learning_backtest(df,
     model, scaler, predict_fn, dl_stats = (None, None, None, None)
     dl_retrain_log = []
     if DL_AVAILABLE:
-        train_df = df if initial_train_end is None else df.loc[:initial_train_end]
-        train_feat = features.loc[train_df.index]
-        init = train_deep_learning_model(
-            train_df,
-            train_feat,
-            prev_thresholds=None,
-            crash_tail_frac=crash_tail_frac
-        )
-        if init:
-            model, scaler, predict_fn, dl_stats = init
-            print("DL: initial model trained.")
-            if dl_stats is not None:
-                th = dl_stats.get("thresholds", (np.nan, np.nan))
-                cr = dl_stats.get("class_returns", [np.nan, np.nan, np.nan])
-                cs = dl_stats.get("class_scores", [np.nan, np.nan, np.nan])
-                cc = dl_stats.get("class_counts", [0, 0, 0])
-                dl_retrain_log.append([idx[0], th[0], th[1], *(cr or []), *(cs or []), *(cc or [])])
+        train_df = df.loc[:initial_train_end_ts]
+        if len(train_df) < 252 * 4:
+            print(
+                "DL: initial training skipped; "
+                f"initial_train_end={initial_train_end_ts.date()} leaves only "
+                f"{len(train_df)} samples (< {252 * 4}). Using rule logic until retrain succeeds."
+            )
         else:
-            print("DL: initial training unavailable; will use rule logic until retrain succeeds.")
+            train_feat = features.loc[train_df.index]
+            init = train_deep_learning_model(
+                train_df,
+                train_feat,
+                prev_thresholds=None,
+                crash_tail_frac=crash_tail_frac
+            )
+            if init:
+                model, scaler, predict_fn, dl_stats = init
+                print(f"DL: initial model trained through {initial_train_end_ts.date()}.")
+                if dl_stats is not None:
+                    th = dl_stats.get("thresholds", (np.nan, np.nan))
+                    cr = dl_stats.get("class_returns", [np.nan, np.nan, np.nan])
+                    cs = dl_stats.get("class_scores", [np.nan, np.nan, np.nan])
+                    cc = dl_stats.get("class_counts", [0, 0, 0])
+                    dl_retrain_log.append([idx[0], th[0], th[1], *(cr or []), *(cs or []), *(cc or [])])
+            else:
+                print("DL: initial training unavailable; will use rule logic until retrain succeeds.")
     else:
         print("DL: not available; using rules.")
     # policy 初始化
@@ -2179,6 +2195,8 @@ def deep_learning_backtest(df,
     return equity, dd, report, weights_df, trades_df, t_eq, notes_df, positions_df, bandit_diag, dl_retrain_df
 # ------------------ Evaluation helpers ------------------
 def run_walk_forward(df, mode, policy, step_months=3, oos_months=6, **kw):
+    kw = dict(kw)
+    kw.pop("initial_train_end", None)
     idx = df.index.sort_values()
     if len(idx) < 252*5:
         print("WFA skipped: not enough data.")
@@ -2215,15 +2233,23 @@ def run_walk_forward(df, mode, policy, step_months=3, oos_months=6, **kw):
     if not rows:
         return None
     return pd.DataFrame(rows)
-def run_abtest(df, oos_start, common_kw):
+def run_abtest(df, oos_start, common_kw, initial_train_end):
     rows = []
     combos = [('baseline', 'none'), ('baseline', 'bandit'), ('dl', 'bandit')]
     oos_date = pd.to_datetime(oos_start)
+    common_kw = dict(common_kw)
+    common_kw.pop("initial_train_end", None)
+    initial_train_end = validate_initial_train_end_for_dl(initial_train_end)
     for mode, policy in combos:
         if mode == 'baseline':
             res = baseline_backtest(df, policy_mode=policy, **common_kw)
         else:
-            res = deep_learning_backtest(df, policy_mode=policy, **common_kw)
+            res = deep_learning_backtest(
+                df,
+                policy_mode=policy,
+                initial_train_end=initial_train_end,
+                **common_kw
+            )
         eq, dd, rep = res[0], res[1], res[2]
         oos_eq = eq.loc[eq.index >= oos_date]
         if len(oos_eq) > 1:
@@ -2239,6 +2265,8 @@ def run_abtest(df, oos_start, common_kw):
     return pd.DataFrame(rows)
 def run_oos_audit(df, dev_end="2018-12-31", val_end="2021-12-31",
                   mode="dl", policy="bandit", out_path="oos_audit.csv", **kw):
+    kw = dict(kw)
+    kw.pop("initial_train_end", None)
     dev_end = pd.to_datetime(dev_end)
     val_end = pd.to_datetime(val_end)
     idx = df.index.sort_values()
@@ -2265,6 +2293,10 @@ def run_oos_audit(df, dev_end="2018-12-31", val_end="2021-12-31",
         if mode == "baseline":
             res = baseline_backtest(df, policy_mode=policy, **kw)
         else:
+            if train_cutoff is None:
+                print("[oos_audit] Skipping DL DEV slice: initial_train_end is required for DL backtests.")
+                rows.append({"slice": name, "CAGR": np.nan, "Sharpe_ex_rf0": np.nan, "MaxDD": np.nan})
+                continue
             res = deep_learning_backtest(
                 df,
                 policy_mode=policy,
@@ -2503,6 +2535,8 @@ def main():
     ap.add_argument('--dl_max_tqqq', type=float, default=0.60, help='Hard cap on TQQQ sleeve')
     ap.add_argument('--dl_trade_max_frac', type=float, default=0.35, help='Max fraction per DL-triggered trade')
     ap.add_argument('--dl_cooldown', type=int, default=3, help='Days to disable DL overlay after a risk-gate trigger')
+    ap.add_argument('--initial_train_end', type=str, default='2018-12-31',
+                    help='Required cutoff date for initial DL training; prevents full-sample DL training.')
     ap.add_argument('--target_vol', type=float, default=0.329758, help='Annualized target vol cap for QQQ exposure')
     ap.add_argument('--risk_gate_max_fut_frac', type=float, default=0.55,
                     help='Risk gate clamp for FUT sleeve; excess flows back to cash')
@@ -2702,6 +2736,7 @@ def main():
             adv_series_tqqq=adv_tqqq,
             adv_series_qqq5=adv_qqq5,
             adv_daily_frac_cap=args.adv_daily_frac_cap,
+            initial_train_end=args.initial_train_end,
             metrics_csv_path=args.metrics_csv,
             crash_mode=args.crash_mode,
             crash_tail_frac=args.crash_tail_frac
@@ -2799,7 +2834,7 @@ def main():
                 print(wfa_d.describe())
     if args.abtest:
         print("Running AB test...")
-        ab = run_abtest(df, args.oos_start, common_kw)
+        ab = run_abtest(df, args.oos_start, common_kw, args.initial_train_end)
         ab_path = f"{args.out_prefix}_abtest.csv"
         ab.to_csv(ab_path, index=False)
         print(f"AB test saved: {ab_path}")
