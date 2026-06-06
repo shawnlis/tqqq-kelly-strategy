@@ -2681,19 +2681,19 @@ def main():
     ap.add_argument('--qqq5-slice-pause', type=float, default=20.0,
                     help='Seconds to pause between slices in slice mode.')
     ap.add_argument('--qqq5-vwap-max-pct', type=float, default=0.15,
-                    help='Max participation (% of est volume, e.g., 0.15=15%) when using VWAP mode.')
+                    help='Max participation (percent of est volume, e.g., 0.15 = 15%%) when using VWAP mode.')
     ap.add_argument('--execution-record', '--exec-log', dest='execution_record', type=str,
                     default='logs/ib_execution_log.csv',
                     help='CSV file to append daily execution vs. simulation tracking (alias --exec-log).')
     ap.add_argument('--dd-alert-threshold', type=float, default=0.25,
-                    help='Trigger Telegram alert if live NAV drawdown exceeds this fraction (e.g., 0.25 = 25%).')
+                    help='Trigger Telegram alert if live NAV drawdown exceeds this fraction (e.g., 0.25 = 25%%).')
     ap.add_argument('--dd-alert-state-json', type=str, default='logs/live_dd_state.json',
                     help='Path to persist live drawdown state (HWM / min DD / last alert date).')
     # Guards
     ap.add_argument('--min-trade-value', type=float, default=500.0)
     ap.add_argument('--min-shares', type=int, default=1)
     ap.add_argument('--max-turnover', type=float, default=0.40)
-    ap.add_argument('--min-drift', type=float, default=0.010, help='Skip trading if turnover/equity < this (e.g., 0.010 = 1%).')
+    ap.add_argument('--min-drift', type=float, default=0.010, help='Skip trading if turnover/equity < this (e.g., 0.010 = 1%%).')
     ap.add_argument('--sum-cap', type=float, default=0.98)
     ap.add_argument('--qqq5-scale', type=float, default=5.0/3.0)
     ap.add_argument('--use-fut-mnq', action='store_true',

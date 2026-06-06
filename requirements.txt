@@ -1,0 +1,12 @@
+numpy>=1.26.0
+pandas>=2.2.0
+yfinance>=0.2.40
+matplotlib>=3.8.0
+scikit-learn>=1.4.0
+pandas-datareader>=0.10.0
+requests>=2.31.0
+pytz>=2024.1
+pandas-market-calendars>=4.4.0
+PyYAML>=6.0.1
+ib-insync>=0.9.86
+pytest>=8.0.0
