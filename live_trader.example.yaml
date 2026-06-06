@@ -1,0 +1,43 @@
+# Copy to live_trader.yaml for local live/paper trading.
+# Do not commit live_trader.yaml or real account credentials.
+
+strategy: qqq_deep_learning_and_baseline_experimental.py
+start: "2010-02-11"
+end:
+keepers_csv: keeper_single.csv
+oos_csv:
+topn: 1
+committee: off
+committee_clamp:
+pick_row:
+exec_mode: dry_run
+idempotency_dir: .state
+jsonl: logs/live_trader.jsonl
+
+base_kelly_frac:
+target_vol:
+bandit_alpha:
+rebal_days:
+
+oos_prune: true
+close_window: false
+use_fut_mnq: false
+mm_qqq5_replicate: false
+mm_qqq5_leverage:
+
+guards:
+  min_trade_value:
+  min_shares:
+  max_turnover:
+  min_drift:
+  sum_cap:
+  qqq5_scale:
+
+moomoo:
+  mm_host: 127.0.0.1
+  mm_port: 11111
+  mm_trd_env: SIMULATE
+  mm_acc_id:
+
+# Secrets such as IB_ACCOUNT, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+# and MOOMOO_TRADE_PWD should be provided through .env or the shell.

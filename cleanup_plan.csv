@@ -1,0 +1,156 @@
+project,current_path,type,proposed_category,proposed_destination,reason,confidence,safe_to_move,manual_review_required
+TQQQ Kelly,.state,dir,GIT_IGNORE_ONLY,,local dependency/cache/archive/state directory; ignore for upload,high,false,true
+TQQQ Kelly,archive,dir,GIT_IGNORE_ONLY,,local dependency/cache/archive/state directory; ignore for upload,high,false,false
+TQQQ Kelly,cache,dir,GIT_IGNORE_ONLY,,local dependency/cache/archive/state directory; ignore for upload,high,false,false
+TQQQ Kelly,__pycache__,dir,KEEP_REVIEW,,archive candidate is referenced by .gitignore; kept for review,low,false,true
+TQQQ Kelly,.env,file,SENSITIVE_REVIEW,,sensitive filename pattern; do not upload unless explicitly reviewed,high,false,true
+TQQQ Kelly,.gitignore,file,KEEP_CORE,,"dependency, config, or entrypoint",high,false,false
+TQQQ Kelly,analyze_alpha_attribution.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,analyze_crash_caps.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,analyze_crash_head_performance.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,analyze_execution_vs_backtest.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,analyze_oos_segments.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,CLEANUP_DRY_RUN.md,file,KEEP_CORE,,migration audit report generated for GitHub readiness,high,false,false
+TQQQ Kelly,cleanup_plan.csv,file,KEEP_CORE,,migration audit report generated for GitHub readiness,high,false,false
+TQQQ Kelly,CLEANUP_SUMMARY.md,file,KEEP_CORE,,migration audit report generated for GitHub readiness,high,false,false
+TQQQ Kelly,detect_lookahead_audit.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,GITHUB_READY_CHECKLIST.md,file,KEEP_CORE,,migration audit report generated for GitHub readiness,high,false,false
+TQQQ Kelly,ib_paper_trader.py,file,KEEP_CORE,,"dependency, config, or entrypoint",high,false,false
+TQQQ Kelly,keeper_single.csv,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,live_ma_executor.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,live_trader.yaml,file,SENSITIVE_REVIEW,,sensitive filename pattern; do not upload unless explicitly reviewed,high,false,true
+TQQQ Kelly,ma_enhanced_tqqq.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,ma_grid_backtest.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,qqq_deep_learning_and_baseline.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,qqq_deep_learning_and_baseline_experimental.py,file,KEEP_CORE,,"dependency, config, or entrypoint",high,false,false
+TQQQ Kelly,qqq_neural_sniper.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,qqq_sota_optimized.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,robust_fast.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,robust_full.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,run_crash_mode_experiments.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,run_paper_trader.ps1,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,run_stress_batches.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,run_three_way_ab.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,run_tqqq_strategy.bat,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,stress_sampler.py,file,KEEP_REVIEW,,script may be useful but not confirmed as core,medium,false,true
+TQQQ Kelly,Telegram bot chatid.py,file,SENSITIVE_REVIEW,,sensitive filename pattern; do not upload unless explicitly reviewed,high,false,true
+TQQQ Kelly,.state/2025-10-31_6967bb25f6.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-10-31_ed3602ad13.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-03_ib_6967bb25f6.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-04_ib_6967bb25f6.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-04_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-06_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-07_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-10_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-11_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-12_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-13_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-14_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-17_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-19_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-20_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-21_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-24_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-25_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-26_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-11-28_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-12-01_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-12-02_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-12-04_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-12-05_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-12-09_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-12-10_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-12-11_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-12-12_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-12-15_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-12-17_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-12-18_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-12-19_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-12-22_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-12-23_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2025-12-26_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-01-02_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-01-05_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-01-08_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-01-09_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-01-12_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-01-13_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-01-15_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-01-16_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-01-20_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-01-23_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-01-26_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-01-27_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-01-28_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-01-30_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-02-02_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-02-03_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-02-04_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-02-05_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-02-09_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-02-10_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-02-11_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-02-12_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-02-13_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-02-17_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-02-20_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-02-23_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-02-24_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-02-25_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-02-27_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-03-10_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-03-11_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-03-13_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-03-16_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-03-17_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-03-20_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-03-23_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-03-24_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/2026-03-27_ib_80ebc0f146.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,.state/notify_cooldown.json,file,KEEP_REVIEW,,not clearly generated or safe to archive,medium,false,true
+TQQQ Kelly,cache/prices_00bbd72dd9.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/prices_0c192e7b61.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/prices_195df24dd2.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/prices_1c90053305.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/prices_2a48a4c029.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/prices_3d25ce0d6a.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/prices_4d5b3ea5e9.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/prices_7cf5219052.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/prices_b6d69f38e8.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/prices_c0a62b89ac.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/prices_c6291847a7.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/prices_f06ed636f3.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/prices_f4f45b2086.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/prices_f605da3ba5.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/rf_00bbd72dd9.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/rf_0c192e7b61.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/rf_195df24dd2.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/rf_1c90053305.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/rf_2a48a4c029.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/rf_3d25ce0d6a.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/rf_4d5b3ea5e9.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/rf_7cf5219052.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/rf_b6d69f38e8.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/rf_c0a62b89ac.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/rf_c6291847a7.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/rf_f06ed636f3.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/rf_f4f45b2086.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/rf_f605da3ba5.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/vix_00bbd72dd9.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/vix_0c192e7b61.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/vix_195df24dd2.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/vix_1c90053305.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/vix_2a48a4c029.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/vix_3d25ce0d6a.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/vix_4d5b3ea5e9.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/vix_7cf5219052.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/vix_b6d69f38e8.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/vix_c0a62b89ac.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/vix_c6291847a7.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/vix_f06ed636f3.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/vix_f4f45b2086.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,cache/vix_f605da3ba5.parquet,file,GIT_IGNORE_ONLY,,database/model/cache artifact should be ignored for upload,high,false,true
+TQQQ Kelly,tests/test_ib_paper_trader.py,file,KEEP_CORE,,"source, tests, app assets, or active data tree",high,false,false
+TQQQ Kelly,tests/test_no_dl_full_sample_leak.py,file,KEEP_CORE,,"source, tests, app assets, or active data tree",high,false,false
+TQQQ Kelly,tests/test_ops_guards.py,file,KEEP_CORE,,"source, tests, app assets, or active data tree",high,false,false
+TQQQ Kelly,tests/test_robust_fast.py,file,KEEP_CORE,,"source, tests, app assets, or active data tree",high,false,false

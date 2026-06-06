@@ -1,0 +1,4 @@
+base_kelly_frac,target_vol,bandit_alpha,rebal_days,trade_cost_bps,fut_fin_spread,score
+0.493816,0.329758,0.69744,3,1.5,0.002,1
+0.493816,0.329758,0.69744,3,1.5,0.002,2
+0.493816,0.329758,0.69744,3,1.5,0.002,3
