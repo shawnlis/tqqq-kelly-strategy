@@ -86,6 +86,9 @@ Thumbs.db
 
 .state/
 
+# Raw strict audit walk-forward outputs are reproducible artifacts.
+reports/strict_audit/*_strict_walk_forward.csv
+
 secrets/
 credentials/
 cookies/
