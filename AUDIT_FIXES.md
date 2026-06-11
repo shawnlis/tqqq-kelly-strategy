@@ -226,3 +226,65 @@ Expected result: all tests pass. `Sharpe_DailyExcess` should match the standard 
 
 - Metrics standardization does not prove the strategy is effective.
 - The audit still needs volatility-matched benchmarks, nested parameter selection, realistic trading costs, borrow/financing checks, and tax analysis.
+
+## Post-Fix Audit Summary
+
+This summary maps the original high-risk audit issues to the current fixes and automated evidence.
+
+### Issue 1: Same-Day Signal / Same-Day Return Timing
+
+- Status: fixed.
+- Evidence: `tests/test_backtest_timing.py`.
+- What is verified: day `t` PnL is computed from day `t-1` target positions; day `t` risk gate, Kelly, regime, DL, and allocation decisions can only affect later target weights.
+- Verification command:
+
+```powershell
+python -m pytest -q tests/test_backtest_timing.py --basetemp=tmp/pytest-timing
+```
+
+### Issue 2: DL Cutoff and Label Leakage
+
+- Status: fixed.
+- Evidence: `tests/test_dl_cutoff_safety.py`, `tests/test_robust_fast_dl_cutoff.py`, and `tests/test_no_dl_full_sample_leak.py`.
+- What is verified: `initial_train_end` is required for DL paths; DL does not predict or affect trades before cutoff; rolling retrain data is label-buffered; `robust_fast.py` propagates the cutoff.
+- Verification command:
+
+```powershell
+python -m pytest -q tests/test_dl_cutoff_safety.py tests/test_robust_fast_dl_cutoff.py tests/test_no_dl_full_sample_leak.py --basetemp=tmp/pytest-dl
+```
+
+### Issue 3: Expense Double Count
+
+- Status: fixed.
+- Evidence: `tests/test_benchmark_expense.py`.
+- What is verified: raw adjusted TQQQ benchmark returns are not reduced by expense again by default; TQQQ and QQQ5 sleeves only deduct extra expense when explicit flags are enabled.
+
+### Issue 4: Effective Leverage Cap
+
+- Status: fixed.
+- Evidence: `tests/test_effective_leverage_cap.py`.
+- What is verified: `max_effective_leverage=3.0` caps next-day target effective exposure for baseline and DL paths without changing already-earned day `t` PnL.
+
+### Issue 5: QQQ5 Source Isolation
+
+- Status: fixed.
+- Evidence: `tests/test_qqq5_isolation.py`.
+- What is verified: `disable_qqq5=True` forces `w_qqq5 == 0`; synthetic, hybrid, and unknown QQQ5 sources are disabled by default and are not headline eligible.
+
+### Issue 6: Strict OOS / Walk-Forward
+
+- Status: fixed.
+- Evidence: `tests/test_strict_oos.py` and `tests/test_robust_fast_strict_oos.py`.
+- What is verified: strict OOS truncates input at `test_end`; appending extreme future rows after `test_end` does not change OOS equity or reports; `robust_fast.py` strict OOS verification calls the strategy strict helper.
+
+### Issue 7: Metrics Standardization
+
+- Status: fixed.
+- Evidence: `tests/test_metrics_standardization.py`.
+- What is verified: `Sharpe_DailyExcess` is standard daily excess return Sharpe; `CAGR_over_Vol` is separate; reports include standardized benchmark, alpha, beta, tracking error, information ratio, and compatibility aliases.
+
+### Remaining Post-Fix Limitations
+
+- These fixes reduce known backtest bias paths, but they do not prove durable outperformance versus TQQQ.
+- Headline claims still require actual strict OOS results with `max_effective_leverage=3.0`, no synthetic/hybrid QQQ5, raw TQQQ benchmark returns, and standardized metrics.
+- Parameter data mining, regime overfitting, volatility-matched benchmarks, nested parameter selection, taxes, and live execution gaps remain open research work.
