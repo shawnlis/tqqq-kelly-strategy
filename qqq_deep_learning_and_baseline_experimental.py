@@ -343,6 +343,168 @@ def apply_expense_to_returns(raw_returns, expense, deduct_flag):
     return returns
 
 
+def _safe_divide_metric(num, den):
+    try:
+        num = float(num)
+        den = float(den)
+    except Exception:
+        return float('nan')
+    if not np.isfinite(num) or not np.isfinite(den) or abs(den) <= 1e-12:
+        return float('nan')
+    return float(num / den)
+
+
+def _annualized_cagr(equity, periods_per_year=252):
+    eq = pd.Series(equity).dropna().astype(float)
+    if eq.empty:
+        return float('nan')
+    start = float(eq.iloc[0])
+    end = float(eq.iloc[-1])
+    years = len(eq) / float(periods_per_year)
+    if start <= 0 or end <= 0 or years <= 0:
+        return float('nan')
+    return float((end / start) ** (1.0 / years) - 1.0)
+
+
+def _max_drawdown(equity):
+    eq = pd.Series(equity).dropna().astype(float)
+    if eq.empty:
+        return float('nan')
+    dd = (eq / eq.cummax()) - 1.0
+    return float(dd.min())
+
+
+def _daily_rf_for_index(index, rf_series=None, rf_ann=0.0, periods_per_year=252):
+    idx = pd.Index(index)
+    if rf_series is None:
+        return pd.Series(float(rf_ann or 0.0) / float(periods_per_year), index=idx)
+    try:
+        rf = pd.to_numeric(rf_series, errors='coerce')
+        rf = rf.reindex(idx).ffill().bfill()
+        rf = rf.fillna(float(rf_ann or 0.0))
+        return rf.astype(float) / float(periods_per_year)
+    except Exception:
+        return pd.Series(float(rf_ann or 0.0) / float(periods_per_year), index=idx)
+
+
+def compute_performance_metrics(
+    equity,
+    benchmark_equity=None,
+    daily_returns=None,
+    benchmark_returns=None,
+    rf_series=None,
+    rf_ann=0.0,
+    periods_per_year=252,
+    prefix="",
+):
+    eq = pd.Series(equity).dropna().astype(float)
+    if daily_returns is None:
+        ret = eq.pct_change().dropna()
+    else:
+        ret = pd.Series(daily_returns).dropna().astype(float)
+    ret = ret[np.isfinite(ret)]
+
+    rf_daily = _daily_rf_for_index(ret.index, rf_series=rf_series, rf_ann=rf_ann, periods_per_year=periods_per_year)
+    excess = (ret - rf_daily.reindex(ret.index).fillna(float(rf_ann or 0.0) / float(periods_per_year))).dropna()
+
+    cagr = _annualized_cagr(eq, periods_per_year=periods_per_year)
+    ann_vol = float(ret.std(ddof=1) * np.sqrt(periods_per_year)) if len(ret) > 1 else float('nan')
+    sharpe = _safe_divide_metric(excess.mean(), excess.std(ddof=1)) * np.sqrt(periods_per_year) if len(excess) > 1 else float('nan')
+    if not np.isfinite(sharpe):
+        sharpe = float('nan')
+    downside = excess[excess < 0.0]
+    downside_std = downside.std(ddof=1) if len(downside) > 1 else float('nan')
+    sortino = _safe_divide_metric(excess.mean(), downside_std) * np.sqrt(periods_per_year) if np.isfinite(downside_std) else float('nan')
+    if not np.isfinite(sortino):
+        sortino = float('nan')
+    maxdd = _max_drawdown(eq)
+    calmar = _safe_divide_metric(cagr, abs(maxdd)) if maxdd < 0 else float('nan')
+    cagr_over_vol = _safe_divide_metric(cagr, ann_vol)
+    final_equity = float(eq.iloc[-1]) if not eq.empty else float('nan')
+
+    if benchmark_returns is None and benchmark_equity is not None:
+        bench_eq = pd.Series(benchmark_equity).dropna().astype(float)
+        bench_ret = bench_eq.pct_change().dropna()
+    else:
+        bench_eq = pd.Series(benchmark_equity).dropna().astype(float) if benchmark_equity is not None else pd.Series(dtype=float)
+        bench_ret = pd.Series(benchmark_returns).dropna().astype(float) if benchmark_returns is not None else pd.Series(dtype=float)
+    bench_ret = bench_ret[np.isfinite(bench_ret)]
+
+    beta = alpha_ann = tracking_error = info_ratio = float('nan')
+    bench_cagr = bench_ann_vol = bench_sharpe = bench_maxdd = bench_final = float('nan')
+    if not bench_eq.empty:
+        bench_cagr = _annualized_cagr(bench_eq, periods_per_year=periods_per_year)
+        bench_ann_vol = float(bench_ret.std(ddof=1) * np.sqrt(periods_per_year)) if len(bench_ret) > 1 else float('nan')
+        bench_rf_daily = _daily_rf_for_index(
+            bench_ret.index,
+            rf_series=rf_series,
+            rf_ann=rf_ann,
+            periods_per_year=periods_per_year,
+        )
+        bench_excess = (bench_ret - bench_rf_daily.reindex(bench_ret.index).fillna(float(rf_ann or 0.0) / float(periods_per_year))).dropna()
+        bench_sharpe = _safe_divide_metric(bench_excess.mean(), bench_excess.std(ddof=1)) * np.sqrt(periods_per_year) if len(bench_excess) > 1 else float('nan')
+        if not np.isfinite(bench_sharpe):
+            bench_sharpe = float('nan')
+        bench_maxdd = _max_drawdown(bench_eq)
+        bench_final = float(bench_eq.iloc[-1])
+    elif not bench_ret.empty:
+        bench_ann_vol = float(bench_ret.std(ddof=1) * np.sqrt(periods_per_year)) if len(bench_ret) > 1 else float('nan')
+
+    if not ret.empty and not bench_ret.empty:
+        data = pd.concat([ret.rename('strategy'), bench_ret.rename('benchmark')], axis=1).dropna()
+        if len(data) > 1:
+            y = data['strategy'].astype(float)
+            x = data['benchmark'].astype(float)
+            x_mean = x.mean()
+            y_mean = y.mean()
+            denom = float(((x - x_mean) ** 2).sum())
+            if np.isfinite(denom) and denom > 1e-12:
+                beta = float(((x - x_mean) * (y - y_mean)).sum() / denom)
+                alpha_ann = float((y_mean - beta * x_mean) * periods_per_year)
+            active = y - x
+            active_std = active.std(ddof=1)
+            tracking_error = float(active_std * np.sqrt(periods_per_year)) if np.isfinite(active_std) else float('nan')
+            info_ratio = _safe_divide_metric(active.mean(), active_std) * np.sqrt(periods_per_year) if np.isfinite(active_std) else float('nan')
+            if not np.isfinite(info_ratio):
+                info_ratio = float('nan')
+
+    out = {
+        'CAGR': float(cagr),
+        'AnnVol': float(ann_vol),
+        'Sharpe_DailyExcess': float(sharpe),
+        'CAGR_over_Vol': float(cagr_over_vol),
+        'Sortino_DailyExcess': float(sortino),
+        'MaxDD': float(maxdd),
+        'Calmar': float(calmar),
+        'Final_Equity': float(final_equity),
+        'Beta_vs_Benchmark': float(beta),
+        'Alpha_vs_Benchmark_Ann': float(alpha_ann),
+        'TrackingError_vs_Benchmark': float(tracking_error),
+        'InformationRatio_vs_Benchmark': float(info_ratio),
+        'Benchmark_CAGR': float(bench_cagr),
+        'Benchmark_AnnVol': float(bench_ann_vol),
+        'Benchmark_Sharpe_DailyExcess': float(bench_sharpe),
+        'Benchmark_MaxDD': float(bench_maxdd),
+        'Benchmark_Final_Equity': float(bench_final),
+        'Metric_Definition_Version': 'v2_standard_daily_excess',
+    }
+    # Backward-compatible aliases. Sharpe_ex_rf0 is now the standard daily excess
+    # Sharpe; CAGR/Vol is separately exposed as CAGR_over_Vol.
+    out.update({
+        'Vol': out['AnnVol'],
+        'Sharpe_ex_rf0': out['Sharpe_DailyExcess'],
+        'TQQQ_CAGR': out['Benchmark_CAGR'],
+        'TQQQ_Vol': out['Benchmark_AnnVol'],
+        'TQQQ_Sharpe': out['Benchmark_Sharpe_DailyExcess'],
+        'TQQQ_MaxDD': out['Benchmark_MaxDD'],
+        'TQQQ_Calmar': _safe_divide_metric(out['Benchmark_CAGR'], abs(out['Benchmark_MaxDD'])) if out['Benchmark_MaxDD'] < 0 else float('nan'),
+        'TQQQ_Final_Equity': out['Benchmark_Final_Equity'],
+    })
+    if prefix:
+        return {f"{prefix}{k}": v for k, v in out.items()}
+    return out
+
+
 def _price_meta_for_report(df, deduct_tqqq_expense_in_returns=False, deduct_qqq5_expense_in_returns=False):
     meta = getattr(df, "attrs", {}).get("price_meta", {}) if df is not None else {}
     tqqq_meta = meta.get("TQQQ", {}) if isinstance(meta, dict) else {}
@@ -1787,34 +1949,20 @@ def baseline_backtest(df,
         positions_records,
         columns=['Date','Equity','FUT_Notional','TQQQ_Notional','QQQ5_Notional','L_base','kelly_frac']
     ).set_index('Date')
-    # Metrics
-    ret_eq = equity.pct_change().fillna(0.0)
-    years = len(equity)/252.0
-    cagr = equity.iloc[-1]**(1/years) - 1.0
-    vol = ret_eq.std()*np.sqrt(252.0)
     dd = (equity/equity.cummax()) - 1.0
-    maxdd = dd.min()
-    sharpe = cagr/vol if vol>1e-8 else float('nan')
-    calmar = cagr/abs(maxdd) if maxdd<0 else float('nan')
-    # TQQQ buy&hold
     t_ret = apply_expense_to_returns(
         px['TQQQ'].pct_change().fillna(0.0),
         tqqq_expense,
         deduct_tqqq_expense_in_returns,
     )
     t_eq = (1+t_ret).cumprod()
-    t_cagr = t_eq.iloc[-1]**(1/years) - 1.0
-    t_vol = t_ret.std()*np.sqrt(252.0)
-    t_dd = (t_eq/t_eq.cummax()) - 1.0
-    t_mdd = t_dd.min()
-    t_sharpe = t_cagr/t_vol if t_vol>1e-8 else float('nan')
-    t_calmar = t_cagr/abs(t_mdd) if t_mdd<0 else float('nan')
-    report = {
-        'CAGR': cagr, 'Vol': vol, 'Sharpe_ex_rf0': sharpe, 'MaxDD': maxdd, 'Calmar': calmar,
-        'Trades': len(trades_df), 'Final_Equity': equity.iloc[-1],
-        'TQQQ_CAGR': t_cagr, 'TQQQ_Vol': t_vol, 'TQQQ_Sharpe': t_sharpe,
-        'TQQQ_MaxDD': t_mdd, 'TQQQ_Calmar': t_calmar, 'TQQQ_Final_Equity': t_eq.iloc[-1]
-    }
+    report = compute_performance_metrics(
+        equity,
+        benchmark_equity=t_eq,
+        rf_series=rf_series,
+        rf_ann=rf_ann,
+    )
+    report['Trades'] = len(trades_df)
     report.update(_price_meta_for_report(
         px,
         deduct_tqqq_expense_in_returns=deduct_tqqq_expense_in_returns,
@@ -1913,29 +2061,9 @@ def ma_crossover_backtest(df,
         columns=['Date', 'Equity', 'FUT_Notional', 'TQQQ_Notional', 'QQQ5_Notional', 'L_base', 'kelly_frac']
     ).set_index('Date')
 
-    ret_eq = equity.pct_change().fillna(0.0)
-    years = len(equity) / 252.0
-    cagr = equity.iloc[-1]**(1/years) - 1.0
-    vol = ret_eq.std() * np.sqrt(252.0)
-    maxdd = dd.min()
-    sharpe = cagr / vol if vol > 1e-8 else float('nan')
-    calmar = cagr / abs(maxdd) if maxdd < 0 else float('nan')
-
     t_eq = (1.0 + ret_tqqq).cumprod()
-    t_years = len(t_eq) / 252.0
-    t_cagr = t_eq.iloc[-1]**(1/t_years) - 1.0 if t_years > 0 else np.nan
-    t_vol = ret_tqqq.std() * np.sqrt(252.0)
-    t_dd = (t_eq / t_eq.cummax()) - 1.0
-    t_mdd = t_dd.min()
-    t_sharpe = t_cagr / t_vol if t_vol > 1e-8 else float('nan')
-    t_calmar = t_cagr / abs(t_mdd) if t_mdd < 0 else float('nan')
-
-    report = {
-        'CAGR': cagr, 'Vol': vol, 'Sharpe_ex_rf0': sharpe, 'MaxDD': maxdd, 'Calmar': calmar,
-        'Trades': len(trades_df), 'Final_Equity': equity.iloc[-1],
-        'TQQQ_CAGR': t_cagr, 'TQQQ_Vol': t_vol, 'TQQQ_Sharpe': t_sharpe,
-        'TQQQ_MaxDD': t_mdd, 'TQQQ_Calmar': t_calmar, 'TQQQ_Final_Equity': t_eq.iloc[-1]
-    }
+    report = compute_performance_metrics(equity, benchmark_equity=t_eq)
+    report['Trades'] = len(trades_df)
     report.update(_price_meta_for_report(
         px,
         deduct_tqqq_expense_in_returns=deduct_tqqq_expense_in_returns,
@@ -2685,34 +2813,20 @@ def deep_learning_backtest(df,
         positions_records,
         columns=['Date','Equity','FUT_Notional','TQQQ_Notional','QQQ5_Notional','L_base','kelly_frac']
     ).set_index('Date')
-    # Metrics
-    ret_eq = equity.pct_change().fillna(0.0)
-    years = len(equity)/252.0
-    cagr = equity.iloc[-1]**(1/years) - 1.0
-    vol = ret_eq.std()*np.sqrt(252.0)
     dd = (equity/equity.cummax()) - 1.0
-    maxdd = dd.min()
-    sharpe = cagr/vol if vol>1e-8 else float('nan')
-    calmar = cagr/abs(maxdd) if maxdd<0 else float('nan')
-    # TQQQ buy&hold
     t_ret = apply_expense_to_returns(
         px['TQQQ'].pct_change().fillna(0.0),
         tqqq_expense,
         deduct_tqqq_expense_in_returns,
     )
     t_eq = (1+t_ret).cumprod()
-    t_cagr = t_eq.iloc[-1]**(1/years) - 1.0
-    t_vol = t_ret.std()*np.sqrt(252.0)
-    t_dd = (t_eq/t_eq.cummax()) - 1.0
-    t_mdd = t_dd.min()
-    t_sharpe = t_cagr/t_vol if t_vol>1e-8 else float('nan')
-    t_calmar = t_cagr/abs(t_mdd) if t_mdd<0 else float('nan')
-    report = {
-        'CAGR': cagr, 'Vol': vol, 'Sharpe_ex_rf0': sharpe, 'MaxDD': maxdd, 'Calmar': calmar,
-        'Trades': len(trades_df), 'Final_Equity': equity.iloc[-1],
-        'TQQQ_CAGR': t_cagr, 'TQQQ_Vol': t_vol, 'TQQQ_Sharpe': t_sharpe,
-        'TQQQ_MaxDD': t_mdd, 'TQQQ_Calmar': t_calmar, 'TQQQ_Final_Equity': t_eq.iloc[-1]
-    }
+    report = compute_performance_metrics(
+        equity,
+        benchmark_equity=t_eq,
+        rf_series=rf_series,
+        rf_ann=rf_ann,
+    )
+    report['Trades'] = len(trades_df)
     report.update(_price_meta_for_report(
         px,
         deduct_tqqq_expense_in_returns=deduct_tqqq_expense_in_returns,
@@ -2783,51 +2897,14 @@ def _slice_frame_by_dates(frame, start_ts, end_ts):
         return frame
 
 
-def _compute_equity_report(equity, tqqq_eq=None, prefix=""):
-    eq = pd.Series(equity).dropna().astype(float)
-    if eq.empty:
-        return {
-            f"{prefix}CAGR": float("nan"),
-            f"{prefix}Vol": float("nan"),
-            f"{prefix}Sharpe_ex_rf0": float("nan"),
-            f"{prefix}MaxDD": float("nan"),
-            f"{prefix}Calmar": float("nan"),
-            f"{prefix}Final_Equity": float("nan"),
-        }
-    ret_eq = eq.pct_change().fillna(0.0)
-    years = max(len(eq) / 252.0, 1e-12)
-    cagr = eq.iloc[-1]**(1.0 / years) - 1.0 if eq.iloc[-1] > 0 else float("nan")
-    vol = ret_eq.std() * np.sqrt(252.0)
-    dd = (eq / eq.cummax()) - 1.0
-    maxdd = dd.min()
-    sharpe = cagr / vol if vol > 1e-8 else float("nan")
-    calmar = cagr / abs(maxdd) if maxdd < 0 else float("nan")
-    out = {
-        f"{prefix}CAGR": float(cagr),
-        f"{prefix}Vol": float(vol),
-        f"{prefix}Sharpe_ex_rf0": float(sharpe),
-        f"{prefix}MaxDD": float(maxdd),
-        f"{prefix}Calmar": float(calmar),
-        f"{prefix}Final_Equity": float(eq.iloc[-1]),
-    }
-    if tqqq_eq is not None:
-        t_eq = pd.Series(tqqq_eq).dropna().astype(float)
-        if not t_eq.empty:
-            t_ret = t_eq.pct_change().fillna(0.0)
-            t_years = max(len(t_eq) / 252.0, 1e-12)
-            t_cagr = t_eq.iloc[-1]**(1.0 / t_years) - 1.0 if t_eq.iloc[-1] > 0 else float("nan")
-            t_vol = t_ret.std() * np.sqrt(252.0)
-            t_dd = (t_eq / t_eq.cummax()) - 1.0
-            t_mdd = t_dd.min()
-            out.update({
-                f"{prefix}TQQQ_CAGR": float(t_cagr),
-                f"{prefix}TQQQ_Vol": float(t_vol),
-                f"{prefix}TQQQ_Sharpe": float(t_cagr / t_vol) if t_vol > 1e-8 else float("nan"),
-                f"{prefix}TQQQ_MaxDD": float(t_mdd),
-                f"{prefix}TQQQ_Calmar": float(t_cagr / abs(t_mdd)) if t_mdd < 0 else float("nan"),
-                f"{prefix}TQQQ_Final_Equity": float(t_eq.iloc[-1]),
-            })
-    return out
+def _compute_equity_report(equity, tqqq_eq=None, prefix="", rf_series=None, rf_ann=0.0):
+    return compute_performance_metrics(
+        equity,
+        benchmark_equity=tqqq_eq,
+        rf_series=rf_series,
+        rf_ann=rf_ann,
+        prefix=prefix,
+    )
 
 
 def _normalize_oos_series(series):
@@ -2921,7 +2998,12 @@ def run_strict_oos_slice(
     trades_oos = _slice_frame_by_dates(trades_full, test_start_ts, test_end_ts)
     notes_oos = _slice_frame_by_dates(notes_full, test_start_ts, test_end_ts)
 
-    report_oos = _compute_equity_report(equity_oos, tqqq_oos)
+    report_oos = _compute_equity_report(
+        equity_oos,
+        tqqq_oos,
+        rf_series=kw.get("rf_series"),
+        rf_ann=kw.get("rf_ann", 0.0) or 0.0,
+    )
     report_oos.update({
         "StrictOOS": True,
         "Mode": mode_norm,
@@ -3055,7 +3137,10 @@ def run_strict_walk_forward(df, slices=None, mode="baseline", policy="bandit", c
                 "test_end": pd.Timestamp(test_end).strftime("%Y-%m-%d"),
                 "CAGR": report.get("CAGR"),
                 "MaxDD": report.get("MaxDD"),
+                "Sharpe_DailyExcess": report.get("Sharpe_DailyExcess"),
                 "Sharpe_ex_rf0": report.get("Sharpe_ex_rf0"),
+                "CAGR_over_Vol": report.get("CAGR_over_Vol"),
+                "Sortino_DailyExcess": report.get("Sortino_DailyExcess"),
                 "Final_Equity": report.get("Final_Equity"),
                 "TQQQ_Final_Equity": report.get("TQQQ_Final_Equity"),
                 "InputEndUsed": report.get("InputEndUsed"),
@@ -3072,7 +3157,10 @@ def run_strict_walk_forward(df, slices=None, mode="baseline", policy="bandit", c
                 "test_end": str(test_end),
                 "CAGR": np.nan,
                 "MaxDD": np.nan,
+                "Sharpe_DailyExcess": np.nan,
                 "Sharpe_ex_rf0": np.nan,
+                "CAGR_over_Vol": np.nan,
+                "Sortino_DailyExcess": np.nan,
                 "Final_Equity": np.nan,
                 "TQQQ_Final_Equity": np.nan,
                 "InputEndUsed": "",

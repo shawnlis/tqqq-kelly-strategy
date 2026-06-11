@@ -180,3 +180,49 @@ Expected result: all tests pass. Appending extreme data after a slice's `test_en
 - Strict OOS prevents future path pollution inside each evaluated slice, but it does not solve parameter data mining.
 - Parameter selection still needs train-only selection, nested walk-forward, or an untouched holdout discipline.
 - This issue does not standardize Sharpe/metric definitions or add volatility-matched benchmarks.
+
+## Issue 7: Standardized Performance Metrics
+
+### Original Problem
+
+Report fields mixed multiple metric definitions. In particular, `Sharpe_ex_rf0` was computed like `CAGR / Vol` in several paths, while robust comparison logic also mixed alpha, Calmar, and OOS quality metrics from different definitions. That made strategy-vs-TQQQ comparisons harder to audit and could overstate a standard Sharpe ratio.
+
+### Files Changed
+
+- `qqq_deep_learning_and_baseline_experimental.py`
+- `robust_fast.py`
+- `tests/test_metrics_standardization.py`
+
+### Fix
+
+- Added `compute_performance_metrics` with `Metric_Definition_Version = "v2_standard_daily_excess"`.
+- The helper now computes standard daily excess return Sharpe from daily returns, with RF aligned by date.
+- `CAGR_over_Vol` is reported separately and is no longer treated as the standard Sharpe.
+- Added Sortino, beta, annualized alpha, tracking error, information ratio, and benchmark metrics.
+- `baseline_backtest`, `deep_learning_backtest`, `ma_crossover_backtest`, and strict OOS reporting now use the unified helper.
+- Backward-compatible fields remain:
+  - `Vol` maps to `AnnVol`.
+  - `Sharpe_ex_rf0` maps to `Sharpe_DailyExcess`.
+  - `TQQQ_*` fields map to the benchmark metrics.
+- `robust_fast.py` now prefers `Sharpe_DailyExcess`, `CAGR_over_Vol`, `Alpha_vs_Benchmark_Ann`, and `InformationRatio_vs_Benchmark`, with old fields used only as fallback where needed.
+
+### Tests
+
+- `tests/test_metrics_standardization.py`
+
+### Verification
+
+Run:
+
+```powershell
+python -m py_compile qqq_deep_learning_and_baseline_experimental.py robust_fast.py
+python -m pytest -q tests/test_metrics_standardization.py --basetemp=tmp/pytest-metrics
+python -m pytest -q --basetemp=tmp/pytest
+```
+
+Expected result: all tests pass. `Sharpe_DailyExcess` should match the standard daily excess-return formula, while `CAGR_over_Vol` remains a separate compatibility/summary metric.
+
+### Residual Limits
+
+- Metrics standardization does not prove the strategy is effective.
+- The audit still needs volatility-matched benchmarks, nested parameter selection, realistic trading costs, borrow/financing checks, and tax analysis.

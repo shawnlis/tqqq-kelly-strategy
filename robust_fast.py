@@ -183,6 +183,7 @@ def daily_alpha_vs_tqqq(ret: pd.Series, t_ret: pd.Series) -> float:
     denom = ((x - x_mean) ** 2).sum()
     if denom <= 1e-12:
         beta = 0.0
+        alpha = y_mean
     else:
         beta = ((x - x_mean) * (y - y_mean)).sum() / denom
         alpha = y_mean - beta * x_mean
@@ -199,6 +200,32 @@ def tqqq_price_returns_for_benchmark(df: pd.DataFrame, common_kw: dict | None = 
     if bool(kw.get("deduct_tqqq_expense_in_returns", False)):
         ret = ret - (float(kw.get("tqqq_expense", 0.0) or 0.0) / 252.0)
     return ret
+
+
+def metric_from_report(obj, *names, default=None):
+    if obj is None:
+        return default
+    for name in names:
+        try:
+            val = obj.get(name)
+        except AttributeError:
+            val = None
+        if val is None:
+            continue
+        try:
+            if pd.isna(val):
+                continue
+        except Exception:
+            pass
+        return val
+    return default
+
+
+def preferred_metric_column(df: pd.DataFrame, *names) -> str | None:
+    for name in names:
+        if name in df.columns:
+            return name
+    return None
 
 
 def qqq5_source_from_df(mod, df: pd.DataFrame | None) -> str:
@@ -260,6 +287,11 @@ def compute_quality_metrics(eq_obj,
         "DSR": float("nan"),
         "Calmar": float("nan"),
         "Alpha": float("nan"),
+        "Alpha_vs_Benchmark_Ann": float("nan"),
+        "InformationRatio_vs_Benchmark": float("nan"),
+        "TrackingError_vs_Benchmark": float("nan"),
+        "CAGR_over_Vol": float("nan"),
+        "Sharpe_DailyExcess": float("nan"),
         "Sharpe12m": float("nan"),
         "CAGR": float("nan"),
         "MaxDD": float("nan"),
@@ -275,13 +307,28 @@ def compute_quality_metrics(eq_obj,
     returns = eq_series.pct_change().dropna()
     if not returns.empty:
         metrics["DSR"] = deflated_sharpe_ratio(returns.values)
+        std = returns.std(ddof=1)
+        if np.isfinite(std) and std > 1e-12:
+            metrics["Sharpe_DailyExcess"] = float((returns.mean() / std) * math.sqrt(252.0))
         metrics["Sharpe12m"] = last12m_sharpe(returns)
     cagr, maxdd = compute_cagr_and_maxdd(eq_series)
     metrics["CAGR"] = cagr
     metrics["MaxDD"] = maxdd
     metrics["Calmar"] = calmar_ratio(cagr, maxdd)
+    vol = returns.std(ddof=1) * math.sqrt(252.0) if not returns.empty else float("nan")
+    if np.isfinite(vol) and abs(vol) > 1e-12:
+        metrics["CAGR_over_Vol"] = float(cagr / vol)
     if tqqq_returns is not None and isinstance(tqqq_returns, pd.Series):
         metrics["Alpha"] = daily_alpha_vs_tqqq(returns, tqqq_returns)
+        metrics["Alpha_vs_Benchmark_Ann"] = metrics["Alpha"]
+        data = pd.concat([returns.rename("strategy"), tqqq_returns.rename("benchmark")], axis=1).dropna()
+        if data.shape[0] > 1:
+            active = data["strategy"] - data["benchmark"]
+            active_std = active.std(ddof=1)
+            if np.isfinite(active_std):
+                metrics["TrackingError_vs_Benchmark"] = float(active_std * math.sqrt(252.0))
+            if np.isfinite(active_std) and active_std > 1e-12:
+                metrics["InformationRatio_vs_Benchmark"] = float((active.mean() / active_std) * math.sqrt(252.0))
     return metrics
 
 # ---------- Timeout wrapper (multiprocessing based) ----------
@@ -443,11 +490,12 @@ def select_diverse_topk(df_candidates: pd.DataFrame,
     if target_count <= 0 or df_candidates.empty:
         return df_candidates.copy(), pd.DataFrame(columns=diag_columns), set()
 
-    metric_col = {
-        "dsr": "DSR",
-        "sharpe": "Sharpe_ex_rf0",
-        "calmar": "Calmar",
-    }.get(metric.lower(), "DSR")
+    metric_candidates = {
+        "dsr": ("DSR",),
+        "sharpe": ("Sharpe_DailyExcess", "Sharpe_ex_rf0"),
+        "calmar": ("Calmar",),
+    }.get(metric.lower(), ("DSR",))
+    metric_col = preferred_metric_column(df_candidates, *metric_candidates) or metric_candidates[-1]
 
     ordered_df = df_candidates.copy()
     if metric_col in ordered_df.columns:
@@ -542,7 +590,8 @@ def run_dl_validation(df_candidates: pd.DataFrame,
         returns = extract_returns(eq_obj)
         dl_cagr = rep.get("CAGR") if isinstance(rep, dict) else None
         dl_maxdd = rep.get("MaxDD") if isinstance(rep, dict) else None
-        dl_sharpe = rep.get("Sharpe_ex_rf0") if isinstance(rep, dict) else None
+        dl_sharpe = metric_from_report(rep, "Sharpe_DailyExcess", "Sharpe_ex_rf0")
+        dl_cagr_over_vol = metric_from_report(rep, "CAGR_over_Vol")
         dl_dsr = deflated_sharpe_ratio(returns.values) if returns is not None and returns.size > 0 else float("-inf")
         baseline_cagr = row.get("CAGR")
         baseline_maxdd = row.get("MaxDD")
@@ -570,7 +619,9 @@ def run_dl_validation(df_candidates: pd.DataFrame,
             "cfg_json": row.get("cfg_json"),
             "DL_CAGR": dl_cagr,
             "DL_MaxDD": dl_maxdd,
+            "DL_Sharpe_DailyExcess": dl_sharpe,
             "DL_Sharpe_ex_rf0": dl_sharpe,
+            "DL_CAGR_over_Vol": dl_cagr_over_vol,
             "DL_DSR": dl_dsr,
             "DL_Error": err,
             "baseline_CAGR": baseline_cagr,
@@ -617,16 +668,21 @@ def run_oos_verification(df_candidates: pd.DataFrame,
             eq_obj, rep, err = run_backtest(mod, df_span, common_kw_span, cfg, args.mode, timeout_seconds)
             metrics = compute_quality_metrics(eq_obj, t_ret_span)
 
-            cagr_val = rep.get("CAGR") if isinstance(rep, dict) else None
-            maxdd_val = rep.get("MaxDD") if isinstance(rep, dict) else None
-            sharpe_val = rep.get("Sharpe_ex_rf0") if isinstance(rep, dict) else None
+            cagr_val = metric_from_report(rep, "CAGR") if isinstance(rep, dict) else None
+            maxdd_val = metric_from_report(rep, "MaxDD") if isinstance(rep, dict) else None
+            sharpe_val = metric_from_report(rep, "Sharpe_DailyExcess", "Sharpe_ex_rf0") if isinstance(rep, dict) else None
+            cagr_over_vol_val = metric_from_report(rep, "CAGR_over_Vol") if isinstance(rep, dict) else None
+            alpha_val = metric_from_report(rep, "Alpha_vs_Benchmark_Ann", "Alpha", default=metrics["Alpha"]) if isinstance(rep, dict) else metrics["Alpha"]
+            ir_val = metric_from_report(rep, "InformationRatio_vs_Benchmark", default=metrics["InformationRatio_vs_Benchmark"]) if isinstance(rep, dict) else metrics["InformationRatio_vs_Benchmark"]
 
             record[f"OOS_CAGR_{label}"] = cagr_val
             record[f"OOS_MaxDD_{label}"] = maxdd_val
             record[f"OOS_Sharpe_{label}"] = sharpe_val
+            record[f"OOS_CAGR_over_Vol_{label}"] = cagr_over_vol_val
             record[f"OOS_DSR_{label}"] = metrics["DSR"]
             record[f"OOS_Calmar_{label}"] = metrics["Calmar"]
-            record[f"OOS_Alpha_{label}"] = metrics["Alpha"]
+            record[f"OOS_Alpha_{label}"] = alpha_val
+            record[f"OOS_InformationRatio_{label}"] = ir_val
             record[f"OOS_Sharpe12m_{label}"] = metrics["Sharpe12m"]
             record[f"OOS_Error_{label}"] = err
 
@@ -715,16 +771,21 @@ def run_strict_oos_verification(df_candidates: pd.DataFrame,
                     rep = {}
             metrics = compute_quality_metrics(eq_obj, span.get("tqqq_returns"))
 
-            cagr_val = rep.get("CAGR", metrics.get("CAGR")) if isinstance(rep, dict) else metrics.get("CAGR")
-            maxdd_val = rep.get("MaxDD", metrics.get("MaxDD")) if isinstance(rep, dict) else metrics.get("MaxDD")
-            sharpe_val = rep.get("Sharpe_ex_rf0") if isinstance(rep, dict) else None
+            cagr_val = metric_from_report(rep, "CAGR", default=metrics.get("CAGR")) if isinstance(rep, dict) else metrics.get("CAGR")
+            maxdd_val = metric_from_report(rep, "MaxDD", default=metrics.get("MaxDD")) if isinstance(rep, dict) else metrics.get("MaxDD")
+            sharpe_val = metric_from_report(rep, "Sharpe_DailyExcess", "Sharpe_ex_rf0") if isinstance(rep, dict) else None
+            cagr_over_vol_val = metric_from_report(rep, "CAGR_over_Vol", default=metrics.get("CAGR_over_Vol")) if isinstance(rep, dict) else metrics.get("CAGR_over_Vol")
+            alpha_val = metric_from_report(rep, "Alpha_vs_Benchmark_Ann", "Alpha", default=metrics["Alpha"]) if isinstance(rep, dict) else metrics["Alpha"]
+            ir_val = metric_from_report(rep, "InformationRatio_vs_Benchmark", default=metrics["InformationRatio_vs_Benchmark"]) if isinstance(rep, dict) else metrics["InformationRatio_vs_Benchmark"]
 
             record[f"OOS_CAGR_{label}"] = cagr_val
             record[f"OOS_MaxDD_{label}"] = maxdd_val
             record[f"OOS_Sharpe_{label}"] = sharpe_val
+            record[f"OOS_CAGR_over_Vol_{label}"] = cagr_over_vol_val
             record[f"OOS_DSR_{label}"] = metrics["DSR"]
             record[f"OOS_Calmar_{label}"] = metrics["Calmar"]
-            record[f"OOS_Alpha_{label}"] = metrics["Alpha"]
+            record[f"OOS_Alpha_{label}"] = alpha_val
+            record[f"OOS_InformationRatio_{label}"] = ir_val
             record[f"OOS_Sharpe12m_{label}"] = metrics["Sharpe12m"]
             record[f"OOS_Error_{label}"] = err
 
@@ -764,7 +825,16 @@ def build_manifest(df_final: pd.DataFrame,
     dl_map = {}
     if dl_eval is not None and not dl_eval.empty:
         for _, row in dl_eval.iterrows():
-            dl_map[row.get("cfg_json")] = {k: row.get(k) for k in ["DL_CAGR", "DL_MaxDD", "DL_Sharpe_ex_rf0", "DL_DSR", "DL_Error", "keep"]}
+            dl_map[row.get("cfg_json")] = {k: row.get(k) for k in [
+                "DL_CAGR",
+                "DL_MaxDD",
+                "DL_Sharpe_DailyExcess",
+                "DL_Sharpe_ex_rf0",
+                "DL_CAGR_over_Vol",
+                "DL_DSR",
+                "DL_Error",
+                "keep",
+            ]}
     oos_map = {}
     if oos_eval is not None and not oos_eval.empty:
         for _, row in oos_eval.iterrows():
@@ -779,7 +849,9 @@ def build_manifest(df_final: pd.DataFrame,
             "baseline": {
                 "CAGR": row.get("CAGR"),
                 "MaxDD": row.get("MaxDD"),
+                "Sharpe_DailyExcess": row.get("Sharpe_DailyExcess"),
                 "Sharpe_ex_rf0": row.get("Sharpe_ex_rf0"),
+                "CAGR_over_Vol": row.get("CAGR_over_Vol"),
                 "DSR": row.get("DSR"),
                 "Calmar": row.get("Calmar"),
             },
@@ -1553,9 +1625,11 @@ def main():
                 t_ret = None
 
             dsr_val = deflated_sharpe_ratio(returns_series.values) if returns_series is not None else float("-inf")
-            calmar_val = calmar_ratio(cagr_val, maxdd_val)
+            calmar_val = metric_from_report(rep_seg, "Calmar", default=calmar_ratio(cagr_val, maxdd_val))
             sharpe12_val = last12m_sharpe(returns_series) if isinstance(returns_series, pd.Series) else float("-inf")
-            alpha_val = daily_alpha_vs_tqqq(returns_series, t_ret) if (isinstance(returns_series, pd.Series) and isinstance(t_ret, pd.Series)) else float("-inf")
+            alpha_fallback = daily_alpha_vs_tqqq(returns_series, t_ret) if (isinstance(returns_series, pd.Series) and isinstance(t_ret, pd.Series)) else float("-inf")
+            alpha_val = metric_from_report(rep_seg, "Alpha_vs_Benchmark_Ann", "Alpha", default=alpha_fallback)
+            ir_val = metric_from_report(rep_seg, "InformationRatio_vs_Benchmark", default=float("nan"))
 
             ok_seg = ok_seg and (dsr_val >= args.pilot_min_dsr) and (calmar_val >= args.pilot_min_calmar) \
                      and (sharpe12_val >= args.pilot_last12m_min_sharpe) and (alpha_val >= args.alpha_min)
@@ -1564,6 +1638,7 @@ def main():
             rep_seg["pilot_Calmar"] = calmar_val
             rep_seg["pilot_Last12mSharpe"] = sharpe12_val
             rep_seg["pilot_Alpha_Ann"] = alpha_val
+            rep_seg["pilot_InformationRatio"] = ir_val
 
             return ok_seg, rep_seg, eq_seg
 
@@ -1801,7 +1876,10 @@ def main():
 
     df_res = pd.DataFrame(keep_rows)
     baseline_columns = list(dict.fromkeys(param_keys + [
-        "CAGR", "Vol", "Sharpe_ex_rf0", "MaxDD", "Calmar", "Trades",
+        "CAGR", "AnnVol", "Vol", "Sharpe_DailyExcess", "Sharpe_ex_rf0",
+        "CAGR_over_Vol", "Sortino_DailyExcess", "MaxDD", "Calmar",
+        "Alpha_vs_Benchmark_Ann", "InformationRatio_vs_Benchmark",
+        "TrackingError_vs_Benchmark", "Trades",
         "Final_Equity", "DSR", "det_seed", "cfg_json", "early_stopped"
     ]))
     if df_res.empty:
@@ -1973,9 +2051,11 @@ def main():
                     f"OOS_CAGR_{label}",
                     f"OOS_MaxDD_{label}",
                     f"OOS_Sharpe_{label}",
+                    f"OOS_CAGR_over_Vol_{label}",
                     f"OOS_DSR_{label}",
                     f"OOS_Calmar_{label}",
                     f"OOS_Alpha_{label}",
+                    f"OOS_InformationRatio_{label}",
                     f"OOS_Sharpe12m_{label}",
                     f"OOS_Error_{label}",
                 ])
@@ -2098,7 +2178,20 @@ def main():
 
     dt = time.time() - t0
     print(f"\n[done] total candidates: {len(grid)}, kept: {len(df_res)} | elapsed: {dt/60:.1f} min")
-    display_cols = [c for c in ["CAGR","MaxDD","Sharpe_ex_rf0","DSR","trade_cost_bps","fut_fin_spread","target_vol","base_kelly_frac","bandit_alpha","early_stopped"] if c in df_topk_raw.columns]
+    display_cols = [c for c in [
+        "CAGR",
+        "MaxDD",
+        "Sharpe_DailyExcess",
+        "Sharpe_ex_rf0",
+        "CAGR_over_Vol",
+        "DSR",
+        "trade_cost_bps",
+        "fut_fin_spread",
+        "target_vol",
+        "base_kelly_frac",
+        "bandit_alpha",
+        "early_stopped",
+    ] if c in df_topk_raw.columns]
     print(df_topk_raw[display_cols])
     saved_files = [
         summary_path.name,
