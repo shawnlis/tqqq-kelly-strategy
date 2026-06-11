@@ -190,6 +190,54 @@ def daily_alpha_vs_tqqq(ret: pd.Series, t_ret: pd.Series) -> float:
         return float("-inf")
     return float(alpha * 252.0)
 
+
+def tqqq_price_returns_for_benchmark(df: pd.DataFrame, common_kw: dict | None = None) -> pd.Series | None:
+    if not isinstance(df, pd.DataFrame) or "TQQQ" not in df.columns:
+        return None
+    ret = df["TQQQ"].pct_change().fillna(0.0)
+    kw = common_kw or {}
+    if bool(kw.get("deduct_tqqq_expense_in_returns", False)):
+        ret = ret - (float(kw.get("tqqq_expense", 0.0) or 0.0) / 252.0)
+    return ret
+
+
+def qqq5_source_from_df(mod, df: pd.DataFrame | None) -> str:
+    if df is None:
+        return "unknown"
+    try:
+        if hasattr(mod, "_qqq5_source_from_df"):
+            return str(mod._qqq5_source_from_df(df))
+    except Exception:
+        pass
+    meta = getattr(df, "attrs", {}).get("price_meta", {}) if df is not None else {}
+    if isinstance(meta, dict):
+        qqq5_meta = meta.get("QQQ5", {})
+        if isinstance(qqq5_meta, dict):
+            return str(qqq5_meta.get("source", "unknown"))
+    return "unknown"
+
+
+def ensure_price_meta(mod, df: pd.DataFrame | None, args=None) -> pd.DataFrame | None:
+    if df is None:
+        return df
+    meta = getattr(df, "attrs", {}).get("price_meta", None)
+    if isinstance(meta, dict) and isinstance(meta.get("QQQ5"), dict):
+        return df
+    source = qqq5_source_from_df(mod, df)
+    df.attrs["price_meta"] = {
+        "QQQ": {"source": "market_or_adjusted", "expense_embedded": True},
+        "TQQQ": {"source": "market_or_adjusted", "expense_embedded": True},
+        "QQQ5": {
+            "source": source,
+            "expense_embedded": True,
+            "headline_eligible": False,
+            "allow_synthetic_qqq5": bool(getattr(args, "allow_synthetic_qqq5", False)) if args is not None else False,
+            "disable_qqq5": bool(getattr(args, "disable_qqq5", False)) if args is not None else False,
+        },
+    }
+    return df
+
+
 def compute_cagr_and_maxdd(eq_series: pd.Series) -> tuple[float, float]:
     if eq_series is None or eq_series.empty:
         return float("nan"), float("nan")
@@ -612,6 +660,102 @@ def run_oos_verification(df_candidates: pd.DataFrame,
     filtered = filtered.sort_values(["DSR", "CAGR"], ascending=[False, False], na_position="last")
     return filtered, eval_df
 
+
+def run_strict_oos_verification(df_candidates: pd.DataFrame,
+                                param_keys: list[str],
+                                mod,
+                                args,
+                                span_payload: list[dict],
+                                timeout_seconds: int | float,
+                                enforce_gate: bool):
+    if df_candidates.empty:
+        return df_candidates.copy(), pd.DataFrame()
+    if not hasattr(mod, "run_strict_oos_slice"):
+        raise AttributeError("strategy module must expose run_strict_oos_slice for strict OOS verification.")
+
+    rows: list[dict] = []
+    keep_cfgs: set[str] = set()
+
+    for _, row in df_candidates.iterrows():
+        cfg = cfg_from_row(row, param_keys)
+        cfg_json_val = row.get("cfg_json") or json.dumps(cfg, sort_keys=True)
+
+        record = {"cfg_json": cfg_json_val}
+        primary_pass = False
+        primary_error = None
+        primary_cagr = None
+        primary_maxdd = None
+
+        for idx, span in enumerate(span_payload):
+            label = span["label"]
+            common_kw_span = dict(span["common_kw"])
+            common_kw_span.update(cfg)
+            strict_kwargs = {
+                "df": span["df"],
+                "train_start": span["train_start"],
+                "train_end": span["train_end"],
+                "test_start": span["test_start"],
+                "test_end": span["test_end"],
+                "mode": args.mode,
+                "policy": "bandit",
+                "common_kw": common_kw_span,
+                "initial_train_end": common_kw_span.get("initial_train_end"),
+            }
+            ok, payload = run_with_timeout(mod.run_strict_oos_slice, strict_kwargs, timeout_seconds)
+            if not ok:
+                err = "timeout" if isinstance(payload, dict) and payload.get("timeout") else (
+                    payload.get("error") if isinstance(payload, dict) else repr(payload)
+                )
+                eq_obj, rep = None, {}
+            else:
+                err = None
+                eq_obj = payload.get("equity_oos") if isinstance(payload, dict) else None
+                rep = payload.get("report_oos", {}) if isinstance(payload, dict) else {}
+                if not isinstance(rep, dict):
+                    rep = {}
+            metrics = compute_quality_metrics(eq_obj, span.get("tqqq_returns"))
+
+            cagr_val = rep.get("CAGR", metrics.get("CAGR")) if isinstance(rep, dict) else metrics.get("CAGR")
+            maxdd_val = rep.get("MaxDD", metrics.get("MaxDD")) if isinstance(rep, dict) else metrics.get("MaxDD")
+            sharpe_val = rep.get("Sharpe_ex_rf0") if isinstance(rep, dict) else None
+
+            record[f"OOS_CAGR_{label}"] = cagr_val
+            record[f"OOS_MaxDD_{label}"] = maxdd_val
+            record[f"OOS_Sharpe_{label}"] = sharpe_val
+            record[f"OOS_DSR_{label}"] = metrics["DSR"]
+            record[f"OOS_Calmar_{label}"] = metrics["Calmar"]
+            record[f"OOS_Alpha_{label}"] = metrics["Alpha"]
+            record[f"OOS_Sharpe12m_{label}"] = metrics["Sharpe12m"]
+            record[f"OOS_Error_{label}"] = err
+
+            if idx == 0:
+                primary_error = err
+                primary_cagr = cagr_val
+                primary_maxdd = maxdd_val
+                if not err and isinstance(cagr_val, (int, float)) and isinstance(maxdd_val, (int, float)):
+                    primary_pass = (float(cagr_val) >= args.pilot_min_cagr) and (float(maxdd_val) >= args.pilot_max_dd)
+
+        record["OOS_Pass"] = bool(primary_pass and not primary_error)
+        rows.append(record)
+        if record["OOS_Pass"] or not enforce_gate:
+            keep_cfgs.add(cfg_json_val)
+
+    eval_df = pd.DataFrame(rows)
+    if not keep_cfgs and not eval_df.empty:
+        first_label = span_payload[0]["label"]
+        sort_col = f"OOS_DSR_{first_label}"
+        eval_df[sort_col] = pd.to_numeric(eval_df.get(sort_col), errors="coerce")
+        eval_df = eval_df.sort_values(sort_col, ascending=False)
+        if not eval_df.empty:
+            keep_cfgs = {eval_df.iloc[0]["cfg_json"]}
+
+    filtered = df_candidates[df_candidates["cfg_json"].isin(keep_cfgs)].copy()
+    if not eval_df.empty:
+        filtered = filtered.merge(eval_df, on="cfg_json", how="left")
+    filtered = filtered.sort_values(["DSR", "CAGR"], ascending=[False, False], na_position="last")
+    return filtered, eval_df
+
+
 def build_manifest(df_final: pd.DataFrame,
                    param_keys: list[str],
                    dl_eval: pd.DataFrame | None = None,
@@ -698,6 +842,47 @@ def parse_oos_spans(args) -> list[tuple[str, str, str]]:
             start_5y = args.oos_start
         spans.append((derive_span_label(start_5y, args.end, 1, fallback="5y"), start_5y, args.end))
     return spans
+
+
+def parse_strict_oos_spans(args) -> list[tuple[str, str, str, str, str]]:
+    spans: list[tuple[str, str, str, str, str]] = []
+    raw = getattr(args, "strict_oos_spans", None)
+    if raw:
+        parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+        for idx, part in enumerate(parts):
+            label = None
+            if "@" in part:
+                se, label = part.split("@", 1)
+            else:
+                se = part
+            fields = [s.strip() for s in se.split(":")]
+            if len(fields) != 4 or not all(fields):
+                raise ValueError(
+                    "--strict-oos-spans entries must use "
+                    "train_start:train_end:test_start:test_end@label"
+                )
+            train_start, train_end, test_start, test_end = fields
+            label = label.strip() if label else f"strict{idx+1}"
+            spans.append((label, train_start, train_end, test_start, test_end))
+    else:
+        train_start = getattr(args, "start", None)
+        train_end = getattr(args, "initial_train_end", None)
+        test_start = getattr(args, "oos_start", None)
+        test_end = getattr(args, "end", None)
+        if not all([train_start, train_end, test_start, test_end]):
+            raise ValueError("strict OOS default span requires start, initial_train_end, oos_start, and end.")
+        spans.append(("strict", train_start, train_end, test_start, test_end))
+    return spans
+
+
+def oos_span_initial_train_end(span_start: str) -> str:
+    return pd.Timestamp(span_start).strftime("%Y-%m-%d")
+
+
+def common_kw_for_oos_span(common_kw: dict, span_start: str) -> dict:
+    out = dict(common_kw)
+    out["initial_train_end"] = oos_span_initial_train_end(span_start)
+    return out
 
 def config_hash(cfg: dict) -> str:
     return sha1(json.dumps(cfg, sort_keys=True))
@@ -789,9 +974,16 @@ def prepare_dataset(mod, start_date, end_date, args):
         class Dummy: pass
         _a = Dummy(); _a.start = start_date; _a.end = end_date
         _a.qqq_csv = _a.tqqq_csv = _a.qqq5_csv = None
+        _a.disable_qqq5 = bool(getattr(args, "disable_qqq5", False))
+        _a.allow_synthetic_qqq5 = bool(getattr(args, "allow_synthetic_qqq5", False))
         df, _synth5 = mod.load_prices(_a)
+        price_meta = getattr(df, "attrs", {}).get("price_meta", None)
         df = df.loc[(df.index >= start_date) & (df.index <= end_date)]
+        if price_meta is not None:
+            df.attrs["price_meta"] = price_meta
         df.to_parquet(df_cache)
+    df = ensure_price_meta(mod, df, args)
+    price_meta = getattr(df, "attrs", {}).get("price_meta", None)
 
     rf_series = cache_get(rf_cache)
     if rf_series is None:
@@ -824,6 +1016,10 @@ def prepare_dataset(mod, start_date, end_date, args):
             stress_seed = getattr(args, "seed", GLOBAL_SEED)
         df_processed = apply_return_noise(df_processed, noise_std, int(stress_seed))
     df = df_processed
+    if price_meta is not None:
+        df.attrs["price_meta"] = price_meta
+    df = ensure_price_meta(mod, df, args)
+    qqq5_source = qqq5_source_from_df(mod, df)
 
     if isinstance(rf_series, (pd.Series, pd.DataFrame)):
         rf_series = rf_series.reindex(df.index).ffill().bfill()
@@ -838,6 +1034,12 @@ def prepare_dataset(mod, start_date, end_date, args):
         kelly_lookback_days=252*3,
         tqqq_expense=0.009,
         qqq5_expense=0.0095,
+        deduct_tqqq_expense_in_returns=bool(getattr(args, "deduct_tqqq_expense_in_returns", False)),
+        deduct_qqq5_expense_in_returns=bool(getattr(args, "deduct_qqq5_expense_in_returns", False)),
+        max_effective_leverage=getattr(args, "max_effective_leverage", None),
+        disable_qqq5=bool(getattr(args, "disable_qqq5", False)),
+        allow_synthetic_qqq5=bool(getattr(args, "allow_synthetic_qqq5", False)),
+        qqq5_source=qqq5_source,
         use_risk_gate=args.risk_gate,
         vix_series=vix_series if isinstance(vix_series, (pd.Series, pd.DataFrame)) else None,
         dl_conf=args.dl_conf,
@@ -858,9 +1060,25 @@ def prepare_dataset(mod, start_date, end_date, args):
 
     return df, common_kw
 
+def build_backtest_kwargs(df, common_kw, cfg, mode, policy_mode='bandit'):
+    mode = (mode or "baseline").lower()
+    bt_kwargs = dict(df=df, policy_mode=policy_mode, **common_kw, **cfg)
+    if mode == "dl":
+        cutoff = bt_kwargs.get("initial_train_end")
+        if cutoff is None or str(cutoff).strip() == "":
+            raise ValueError("initial_train_end is required for robust_fast mode=dl.")
+    else:
+        bt_kwargs.pop("initial_train_end", None)
+    return bt_kwargs
+
+
 def run_backtest(mod, df, common_kw, cfg, mode, timeout_seconds):
     fn = mod.baseline_backtest if mode == "baseline" else mod.deep_learning_backtest
-    ok, payload = run_with_timeout(fn, dict(df=df, policy_mode='bandit', **common_kw, **cfg), timeout_seconds)
+    try:
+        bt_kwargs = build_backtest_kwargs(df, common_kw, cfg, mode, policy_mode='bandit')
+    except ValueError as exc:
+        return None, None, str(exc)
+    ok, payload = run_with_timeout(fn, bt_kwargs, timeout_seconds)
     if not ok:
         if isinstance(payload, dict) and payload.get("timeout"):
             return None, None, "timeout"
@@ -887,7 +1105,10 @@ def eval_with_early_stop(mod, df, common_kw, cfg, cutoff_cagr: float,
     for frac in fractions:
         n = max(200, int(len(df) * frac))
         df_sub = df.iloc[:n]
-        bt_kwargs = dict(df=df_sub, policy_mode='bandit', **common_kw, **cfg)
+        try:
+            bt_kwargs = build_backtest_kwargs(df_sub, common_kw, cfg, mode, policy_mode='bandit')
+        except ValueError as exc:
+            return {"early_stopped": True, "report": {"Error": str(exc)}, "equity": None}
         ok, payload = run_with_timeout(fn, bt_kwargs, timeout_seconds)
         if not ok:
             if isinstance(payload, dict) and payload.get("timeout"):
@@ -912,6 +1133,35 @@ def eval_with_early_stop(mod, df, common_kw, cfg, cutoff_cagr: float,
     return {"early_stopped": False, "report": report_final, "equity": eq_final}
 
 # ---------- 6) 主流程 ----------
+def build_gate_signature(args, qqq5_source_for_run, effective_seed):
+    return {
+        "pilot_min_cagr": args.pilot_min_cagr,
+        "pilot_max_dd": args.pilot_max_dd,
+        "pilot_relative": bool(args.pilot_relative),
+        "disable_pilot_gate": bool(args.disable_pilot_gate),
+        "pilot_years": args.pilot_years,
+        "rel_cagr_mult": args.rel_cagr_mult,
+        "rel_dd_mult": args.rel_dd_mult,
+        "pilot_two_windows": bool(args.pilot_two_windows),
+        "pilot_min_dsr": args.pilot_min_dsr,
+        "pilot_min_calmar": args.pilot_min_calmar,
+        "pilot_last12m_min_sharpe": args.pilot_last12m_min_sharpe,
+        "alpha_min": args.alpha_min,
+        "slippage_mult": args.slippage_mult,
+        "return_noise_std": args.return_noise_std,
+        "price_lag_days": args.price_lag_days,
+        "stress_seed": args.stress_seed if args.stress_seed is not None else effective_seed,
+        "stress_auto_relax": bool(args.stress_auto_relax),
+        "max_effective_leverage": args.max_effective_leverage,
+        "disable_qqq5": bool(args.disable_qqq5),
+        "allow_synthetic_qqq5": bool(args.allow_synthetic_qqq5),
+        "qqq5_source": qqq5_source_for_run,
+        "initial_train_end": args.initial_train_end,
+        "strict_oos_verify": bool(getattr(args, "strict_oos_verify", False)),
+        "strict_oos_spans": getattr(args, "strict_oos_spans", None),
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--strategy", type=str, required=True,
@@ -942,6 +1192,20 @@ def main():
                     help="压力测试时自动放宽 pilot 门槛（默认开启）")
     ap.add_argument("--no-stress-auto-relax", dest="stress_auto_relax", action="store_false")
     ap.add_argument("--dl-conf", type=float, default=0.62, help="传给 DL 覆盖的阈值（若 mode=dl）")
+    ap.add_argument("--initial-train-end", dest="initial_train_end", type=str, default="2018-12-31",
+                    help="Required cutoff for all deep-learning backtests.")
+    ap.add_argument("--deduct-tqqq-expense-in-returns", dest="deduct_tqqq_expense_in_returns",
+                    action="store_true",
+                    help="Explicit stress override: subtract tqqq_expense/252 from TQQQ price returns.")
+    ap.add_argument("--deduct-qqq5-expense-in-returns", dest="deduct_qqq5_expense_in_returns",
+                    action="store_true",
+                    help="Explicit stress override: subtract qqq5_expense/252 from QQQ5 price returns.")
+    ap.add_argument("--max-effective-leverage", dest="max_effective_leverage", type=float, default=None,
+                    help="Optional strict audit cap on next-day target effective leverage, e.g. 3.0")
+    ap.add_argument("--disable-qqq5", dest="disable_qqq5", action="store_true",
+                    help="Disable all QQQ5 sleeve allocation paths for strict headline audits.")
+    ap.add_argument("--allow-synthetic-qqq5", dest="allow_synthetic_qqq5", action="store_true",
+                    help="Allow synthetic/hybrid QQQ5 for research only; not headline eligible.")
     ap.add_argument("--pilot-min-cagr", type=float, default=0.10, help="Pilot minimum CAGR threshold")
     ap.add_argument("--pilot-max-dd", type=float, default=-0.70, help="Pilot maximum drawdown threshold")
     ap.add_argument("--pilot-relative", action="store_true",
@@ -988,6 +1252,10 @@ def main():
                     help="Comma-separated start:end or start:end@label spans for OOS verification")
     ap.add_argument("--oos-verify", action="store_true",
                     help="Re-run kept configs on [oos-start, end] and export OOS summary/Pareto")
+    ap.add_argument("--strict-oos-verify", action="store_true",
+                    help="Run OOS verification through strategy.run_strict_oos_slice instead of legacy full-path slicing")
+    ap.add_argument("--strict-oos-spans", type=str, default=None,
+                    help="Comma-separated train_start:train_end:test_start:test_end@label strict OOS spans")
     ap.add_argument("--oos-prune", action="store_true",
                     help="Drop configs whose OOS quality breaches degradation limits")
     ap.add_argument("--oos-degrade-ratio", type=float, default=0.75,
@@ -1028,6 +1296,8 @@ def main():
             args.validate_dl = True
         if not args.oos_verify:
             args.oos_verify = True
+    if args.strict_oos_verify:
+        args.oos_verify = True
 
     stress_triggers = []
     if args.slippage_mult > 1.0:
@@ -1115,9 +1385,16 @@ def main():
         class Dummy: pass
         _a = Dummy(); _a.start = args.start; _a.end = args.end
         _a.qqq_csv = _a.tqqq_csv = _a.qqq5_csv = None
+        _a.disable_qqq5 = bool(args.disable_qqq5)
+        _a.allow_synthetic_qqq5 = bool(args.allow_synthetic_qqq5)
         df, _synth5 = mod.load_prices(_a)
+        price_meta = getattr(df, "attrs", {}).get("price_meta", None)
         df = df.loc[(df.index >= args.start) & (df.index <= args.end)]
+        if price_meta is not None:
+            df.attrs["price_meta"] = price_meta
         df.to_parquet(df_cache)
+    df = ensure_price_meta(mod, df, args)
+    qqq5_source_for_run = qqq5_source_from_df(mod, df)
 
     rf_series = cache_get(rf_cache)
     if rf_series is None:
@@ -1149,6 +1426,13 @@ def main():
         use_risk_gate=args.risk_gate,
         vix_series=vix_series if isinstance(vix_series, (pd.Series, pd.DataFrame)) else None,
         dl_conf=args.dl_conf,
+        deduct_tqqq_expense_in_returns=bool(args.deduct_tqqq_expense_in_returns),
+        deduct_qqq5_expense_in_returns=bool(args.deduct_qqq5_expense_in_returns),
+        max_effective_leverage=args.max_effective_leverage,
+        disable_qqq5=bool(args.disable_qqq5),
+        allow_synthetic_qqq5=bool(args.allow_synthetic_qqq5),
+        qqq5_source=qqq5_source_for_run,
+        initial_train_end=args.initial_train_end,
         dl_max_qqq5=0.35,
         dl_max_tqqq=0.60,
         dl_trade_max_frac=0.35,
@@ -1160,25 +1444,7 @@ def main():
 
     # 断点续跑
     ckpt_path = Path(args.resume)
-    gate_signature = {
-        "pilot_min_cagr": args.pilot_min_cagr,
-        "pilot_max_dd": args.pilot_max_dd,
-        "pilot_relative": bool(args.pilot_relative),
-        "disable_pilot_gate": bool(args.disable_pilot_gate),
-        "pilot_years": args.pilot_years,
-        "rel_cagr_mult": args.rel_cagr_mult,
-        "rel_dd_mult": args.rel_dd_mult,
-        "pilot_two_windows": bool(args.pilot_two_windows),
-        "pilot_min_dsr": args.pilot_min_dsr,
-        "pilot_min_calmar": args.pilot_min_calmar,
-        "pilot_last12m_min_sharpe": args.pilot_last12m_min_sharpe,
-        "alpha_min": args.alpha_min,
-        "slippage_mult": args.slippage_mult,
-        "return_noise_std": args.return_noise_std,
-        "price_lag_days": args.price_lag_days,
-        "stress_seed": args.stress_seed if args.stress_seed is not None else effective_seed,
-        "stress_auto_relax": bool(args.stress_auto_relax),
-    }
+    gate_signature = build_gate_signature(args, qqq5_source_for_run, effective_seed)
     print(f"[gate] {gate_signature}")
     results_map: dict[str, dict] = {}
     done_keys: set[str] = set()
@@ -1257,10 +1523,11 @@ def main():
         pilot_eq = None
 
         def run_pilot_segment(df_seg):
+            bt_kwargs = build_backtest_kwargs(df_seg, common_kw, cfg, args.mode, policy_mode='bandit')
             if args.mode == "baseline":
-                pilot_result = mod.baseline_backtest(df_seg, policy_mode='bandit', **common_kw, **cfg)
+                pilot_result = mod.baseline_backtest(**bt_kwargs)
             else:
-                pilot_result = mod.deep_learning_backtest(df_seg, policy_mode='bandit', **common_kw, **cfg)
+                pilot_result = mod.deep_learning_backtest(**bt_kwargs)
             eq_seg, _dd_seg, rep_seg_raw = pilot_result[0], pilot_result[1], pilot_result[2]
             rep_seg = dict(rep_seg_raw)
             cagr_val = float(rep_seg.get("CAGR", -1e9))
@@ -1275,7 +1542,7 @@ def main():
 
             t_ret = None
             if args.pilot_relative and not df_seg.empty and ("TQQQ" in df_seg.columns):
-                t_ret = df_seg["TQQQ"].pct_change().fillna(0.0) - (common_kw.get("tqqq_expense", 0.009) / 252.0)
+                t_ret = tqqq_price_returns_for_benchmark(df_seg, common_kw)
                 t_eq = (1.0 + t_ret).cumprod()
                 years = max(1e-9, len(t_eq) / 252.0)
                 t_cagr = float(t_eq.iloc[-1]) ** (1.0 / years) - 1.0
@@ -1636,35 +1903,64 @@ def main():
     span_defs: list[tuple[str, str, str]] = []
     span_payload: list[dict] = []
     if args.oos_verify:
-        span_defs = parse_oos_spans(args)
         span_payload = []
-        for label, span_start, span_end in span_defs:
-            df_span, common_kw_span = prepare_dataset(mod, span_start, span_end, args)
-            expense = float(common_kw_span.get("tqqq_expense", 0.0) or 0.0)
-            if isinstance(df_span, pd.DataFrame) and "TQQQ" in df_span.columns:
-                tqqq_ret = df_span["TQQQ"].pct_change().fillna(0.0) - expense / 252.0
-            else:
-                tqqq_ret = None
-            span_payload.append({
-                "label": label,
-                "start": span_start,
-                "end": span_end,
-                "df": df_span,
-                "common_kw": common_kw_span,
-                "tqqq_returns": tqqq_ret,
-            })
+        if args.strict_oos_verify:
+            strict_span_defs = parse_strict_oos_spans(args)
+            span_defs = [(label, test_start, test_end) for label, _train_start, _train_end, test_start, test_end in strict_span_defs]
+            for label, train_start, train_end, test_start, test_end in strict_span_defs:
+                df_span, common_kw_span = prepare_dataset(mod, train_start, test_end, args)
+                common_kw_span["initial_train_end"] = train_end
+                tqqq_df = df_span.loc[(df_span.index >= test_start) & (df_span.index <= test_end)]
+                tqqq_ret = tqqq_price_returns_for_benchmark(tqqq_df, common_kw_span)
+                span_payload.append({
+                    "label": label,
+                    "train_start": train_start,
+                    "train_end": train_end,
+                    "test_start": test_start,
+                    "test_end": test_end,
+                    "start": test_start,
+                    "end": test_end,
+                    "df": df_span,
+                    "common_kw": common_kw_span,
+                    "tqqq_returns": tqqq_ret,
+                })
+        else:
+            span_defs = parse_oos_spans(args)
+            for label, span_start, span_end in span_defs:
+                df_span, common_kw_span = prepare_dataset(mod, span_start, span_end, args)
+                common_kw_span = common_kw_for_oos_span(common_kw_span, span_start)
+                tqqq_ret = tqqq_price_returns_for_benchmark(df_span, common_kw_span)
+                span_payload.append({
+                    "label": label,
+                    "start": span_start,
+                    "end": span_end,
+                    "df": df_span,
+                    "common_kw": common_kw_span,
+                    "tqqq_returns": tqqq_ret,
+                })
 
         oos_eval_path = Path(f"{out_prefix}_oos.csv")
         if span_payload:
-            df_selected, oos_eval_df = run_oos_verification(
-                df_selected,
-                param_keys,
-                mod,
-                args,
-                span_payload,
-                timeout_seconds,
-                enforce_gate=bool(args.final_shortlist),
-            )
+            if args.strict_oos_verify:
+                df_selected, oos_eval_df = run_strict_oos_verification(
+                    df_selected,
+                    param_keys,
+                    mod,
+                    args,
+                    span_payload,
+                    timeout_seconds,
+                    enforce_gate=bool(args.final_shortlist),
+                )
+            else:
+                df_selected, oos_eval_df = run_oos_verification(
+                    df_selected,
+                    param_keys,
+                    mod,
+                    args,
+                    span_payload,
+                    timeout_seconds,
+                    enforce_gate=bool(args.final_shortlist),
+                )
             print(f"[oos] spans={[(p['label'], p['start'], p['end']) for p in span_payload]} -> {len(df_selected)} configs")
         else:
             oos_eval_df = pd.DataFrame()
@@ -1733,7 +2029,24 @@ def main():
         grid_signature = sha1(json.dumps(grid_dict, sort_keys=True, default=str))
     except Exception:
         grid_signature = None
-    span_meta = [{"label": lbl, "start": st, "end": ed} for (lbl, st, ed) in span_defs] if span_defs else []
+    span_meta = []
+    if span_payload:
+        for payload in span_payload:
+            meta_row = {
+                "label": payload.get("label"),
+                "start": payload.get("start"),
+                "end": payload.get("end"),
+            }
+            if args.strict_oos_verify:
+                meta_row.update({
+                    "train_start": payload.get("train_start"),
+                    "train_end": payload.get("train_end"),
+                    "test_start": payload.get("test_start"),
+                    "test_end": payload.get("test_end"),
+                })
+            span_meta.append(meta_row)
+    elif span_defs:
+        span_meta = [{"label": lbl, "start": st, "end": ed} for (lbl, st, ed) in span_defs]
     metadata = {
         "strategy_path": str(Path(args.strategy)),
         "strategy_sha": strategy_sha,
@@ -1756,11 +2069,18 @@ def main():
             "metric": args.diversity_metric,
         },
         "oos_verify": bool(args.oos_verify),
+        "strict_oos_verify": bool(args.strict_oos_verify),
         "oos_spans": span_meta,
+        "strict_oos_spans": args.strict_oos_spans,
+        "initial_train_end": args.initial_train_end,
         "oos_degrade_ratio": args.oos_degrade_ratio,
         "oos_prune": bool(args.oos_prune),
         "min_trades": args.min_trades,
         "max_turnover": args.max_turnover,
+        "max_effective_leverage": args.max_effective_leverage,
+        "disable_qqq5": bool(args.disable_qqq5),
+        "allow_synthetic_qqq5": bool(args.allow_synthetic_qqq5),
+        "qqq5_source": qqq5_source_for_run,
         "preset_v5e": bool(args.preset_v5e),
         "final_shortlist": bool(args.final_shortlist),
         "stress": {

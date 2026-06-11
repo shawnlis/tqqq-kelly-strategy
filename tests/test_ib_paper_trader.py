@@ -28,12 +28,13 @@ def test_turnover_and_min_drift_gate():
 def test_idempotency_lock(tmp_path: Path):
     state_dir = tmp_path / ".state"
     os.makedirs(state_dir, exist_ok=True)
-    skip, lock = idempotency_should_skip("2025-10-31", "abc123", str(state_dir))
+    skip, lock = idempotency_should_skip("2025-10-31", "ib", "abc123", str(state_dir))
     assert skip is False
     assert isinstance(lock, Path)
-    idempotency_mark(lock, {"fingerprint": "abc123"})
-    skip2, _ = idempotency_should_skip("2025-10-31", "abc123", str(state_dir))
+    assert lock.name == "2025-10-31_ib_abc123.json"
+    idempotency_mark(lock)
+    skip2, _ = idempotency_should_skip("2025-10-31", "ib", "abc123", str(state_dir))
     assert skip2 is True
     # ensure file written
     payload = json.loads(lock.read_text())
-    assert payload["fingerprint"] == "abc123"
+    assert payload["locked"] is True

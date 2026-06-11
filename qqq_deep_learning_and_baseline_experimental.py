@@ -56,6 +56,14 @@ if not DL_AVAILABLE:
     PRIMARY_COMPUTE_DEVICE = "cpu"
 warnings.filterwarnings("ignore", category=UserWarning)
 DAILY_METRICS_CSV = "logs/strategy_daily_metrics.csv"
+DL_DEFAULT_LOOK_AHEAD = 5
+DL_DEFAULT_CRASH_LOOK = 25
+
+
+def dl_label_buffer_days(look_ahead=DL_DEFAULT_LOOK_AHEAD, crash_look=DL_DEFAULT_CRASH_LOOK):
+    return max(int(look_ahead or 0), int(crash_look or 0))
+
+
 def log_daily_metrics(metrics_dict, csv_path: str = DAILY_METRICS_CSV):
     """
     Append one row of daily metrics to a CSV file.
@@ -179,6 +187,109 @@ def fetch_vix_series_or_none(start_date, end_date):
         return vix
     except Exception:
         return None
+QQQ5_SOURCE_VALUES = {"disabled", "csv", "synthetic", "hybrid", "real_market", "unknown"}
+QQQ5_SYNTHETIC_OR_UNTRUSTED_SOURCES = {"synthetic", "hybrid", "unknown"}
+
+
+def normalize_qqq5_source(source):
+    if source is None:
+        return "unknown"
+    val = str(source).strip().lower()
+    aliases = {
+        "real": "real_market",
+        "market": "real_market",
+        "market_or_adjusted": "real_market",
+        "live": "real_market",
+        "live_market": "real_market",
+        "disabled": "disabled",
+        "csv": "csv",
+        "synthetic": "synthetic",
+        "hybrid": "hybrid",
+        "unknown": "unknown",
+    }
+    return aliases.get(val, val if val in QQQ5_SOURCE_VALUES else "unknown")
+
+
+def is_qqq5_headline_eligible(source, disable_qqq5=False, allow_synthetic_qqq5=False):
+    source_norm = normalize_qqq5_source(source)
+    if bool(disable_qqq5) or source_norm == "disabled":
+        return False
+    return source_norm == "real_market"
+
+
+def _qqq5_source_from_df(df, qqq5_source=None):
+    if qqq5_source is not None:
+        return normalize_qqq5_source(qqq5_source)
+    meta = getattr(df, "attrs", {}).get("price_meta", {}) if df is not None else {}
+    qqq5_meta = meta.get("QQQ5", {}) if isinstance(meta, dict) else {}
+    return normalize_qqq5_source(qqq5_meta.get("source", "unknown"))
+
+
+def resolve_qqq5_policy(df, qqq5_source=None, disable_qqq5=False, allow_synthetic_qqq5=False):
+    source = _qqq5_source_from_df(df, qqq5_source=qqq5_source)
+    disabled = bool(disable_qqq5)
+    report_source = "disabled" if disabled else source
+    if disabled:
+        allowed = False
+    elif source in QQQ5_SYNTHETIC_OR_UNTRUSTED_SOURCES and not bool(allow_synthetic_qqq5):
+        allowed = False
+    else:
+        allowed = True
+    headline = is_qqq5_headline_eligible(source, disabled, allow_synthetic_qqq5)
+    return {
+        "source": report_source,
+        "raw_source": source,
+        "disabled": disabled,
+        "allow_synthetic": bool(allow_synthetic_qqq5),
+        "allowed": bool(allowed),
+        "headline_eligible": bool(headline),
+        "strict_no_synthetic": not bool(allow_synthetic_qqq5),
+        "research_only": bool(allowed and not headline),
+    }
+
+
+def qqq5_policy_report_stats(weights_df, trades_df, qqq5_policy):
+    if weights_df is not None and "w_qqq5" in weights_df.columns and len(weights_df):
+        w = pd.to_numeric(weights_df["w_qqq5"], errors="coerce").fillna(0.0)
+        max_w = float(w.max())
+        avg_w = float(w.mean())
+    else:
+        max_w = 0.0
+        avg_w = 0.0
+    qqq5_trades = 0
+    if trades_df is not None and len(trades_df):
+        try:
+            qqq5_trades = int(((trades_df["From"] == "QQQ5") | (trades_df["To"] == "QQQ5")).sum())
+        except Exception:
+            qqq5_trades = 0
+    research_only = bool(qqq5_policy.get("research_only", False) or (
+        not qqq5_policy.get("headline_eligible", False) and max_w > 1e-12
+    ))
+    return {
+        "QQQ5_Source": qqq5_policy.get("source", "unknown"),
+        "QQQ5_Disabled": bool(qqq5_policy.get("disabled", False)),
+        "QQQ5_Allowed": bool(qqq5_policy.get("allowed", False)),
+        "QQQ5_AllowSynthetic": bool(qqq5_policy.get("allow_synthetic", False)),
+        "QQQ5_HeadlineEligible": bool(qqq5_policy.get("headline_eligible", False)),
+        "QQQ5_MaxWeight": max_w,
+        "QQQ5_AvgWeight": avg_w,
+        "QQQ5_Trades": qqq5_trades,
+        "Strict_NoSyntheticQQQ5": bool(qqq5_policy.get("strict_no_synthetic", True)),
+        "QQQ5_ResearchOnly": research_only,
+    }
+
+
+def _qqq5_meta(source, disable_qqq5=False, allow_synthetic_qqq5=False):
+    source_norm = normalize_qqq5_source(source)
+    return {
+        "source": source_norm,
+        "expense_embedded": True,
+        "headline_eligible": is_qqq5_headline_eligible(source_norm, disable_qqq5, allow_synthetic_qqq5),
+        "allow_synthetic_qqq5": bool(allow_synthetic_qqq5),
+        "disable_qqq5": bool(disable_qqq5),
+    }
+
+
 def load_prices(args):
     # QQQ
     if args.qqq_csv and os.path.exists(args.qqq_csv):
@@ -196,19 +307,57 @@ def load_prices(args):
         tqqq = get_close_series_from_yf('TQQQ', start=args.start, end=args.end, auto_adjust=True)
     # QQQ5 (real or synthesized from QQQ as daily 5x)
     synth5 = False
+    qqq5_source = "unknown"
     if args.qqq5_csv and os.path.exists(args.qqq5_csv):
         v = pd.read_csv(args.qqq5_csv, parse_dates=['Date']).set_index('Date')
         qqq5 = (v['Adj Close'] if 'Adj Close' in v.columns else v['Close']).astype(float)
         qqq5.name = 'QQQ5'
+        qqq5_source = "csv"
     else:
         qqq5, real_used = build_qqq5_hybrid_from_base(
             qqq_close=qqq,
             start=args.start,
             end=args.end
         )
-        synth5 = not real_used
+        qqq5_source = normalize_qqq5_source(getattr(qqq5, "attrs", {}).get("source", None))
+        if qqq5_source == "unknown":
+            qqq5_source = "real_market" if real_used else "synthetic"
+        synth5 = qqq5_source in {"synthetic", "hybrid"}
     df = pd.concat([qqq, tqqq, qqq5], axis=1).dropna()
+    df.attrs["price_meta"] = {
+        "QQQ": {"source": "market_or_adjusted", "expense_embedded": True},
+        "TQQQ": {"source": "market_or_adjusted", "expense_embedded": True},
+        "QQQ5": _qqq5_meta(
+            qqq5_source,
+            disable_qqq5=bool(getattr(args, "disable_qqq5", False)),
+            allow_synthetic_qqq5=bool(getattr(args, "allow_synthetic_qqq5", False)),
+        ),
+    }
     return df, synth5
+
+
+def apply_expense_to_returns(raw_returns, expense, deduct_flag):
+    returns = pd.to_numeric(raw_returns, errors='coerce').copy()
+    if bool(deduct_flag):
+        returns = returns - (float(expense or 0.0) / 252.0)
+    return returns
+
+
+def _price_meta_for_report(df, deduct_tqqq_expense_in_returns=False, deduct_qqq5_expense_in_returns=False):
+    meta = getattr(df, "attrs", {}).get("price_meta", {}) if df is not None else {}
+    tqqq_meta = meta.get("TQQQ", {}) if isinstance(meta, dict) else {}
+    qqq5_meta = meta.get("QQQ5", {}) if isinstance(meta, dict) else {}
+    qqq5_source = normalize_qqq5_source(qqq5_meta.get("source", "unknown"))
+    return {
+        "TQQQ_Expense_Deducted_In_Returns": bool(deduct_tqqq_expense_in_returns),
+        "QQQ5_Expense_Deducted_In_Returns": bool(deduct_qqq5_expense_in_returns),
+        "TQQQ_Benchmark_Expense_Deducted": bool(deduct_tqqq_expense_in_returns),
+        "TQQQ_Price_Expense_Embedded": bool(tqqq_meta.get("expense_embedded", True)),
+        "QQQ5_Price_Expense_Embedded": bool(qqq5_meta.get("expense_embedded", True)),
+        "QQQ5_Source": qqq5_source,
+    }
+
+
 def fetch_rf_series_or_default(start_date, end_date):
     """Return BusinessDay-indexed rf series (^IRX close/100) with ffill; None on failure."""
     try:
@@ -322,10 +471,16 @@ def build_qqq5_hybrid_from_base(qqq_close, start=None, end=None):
     real, ticker = _first_available_qqq5_series(start, end)
     if real is None:
         print('Warning: QQQ5 live prices unavailable; using synthetic series only.')
+        synth.attrs["source"] = "synthetic"
+        synth.attrs["synthetic_used"] = True
+        synth.attrs["real_used"] = False
         return synth, False
     real = pd.to_numeric(real, errors='coerce')
     if real.dropna().empty:
         print('Warning: QQQ5 live prices contained no usable data; using synthetic series only.')
+        synth.attrs["source"] = "synthetic"
+        synth.attrs["synthetic_used"] = True
+        synth.attrs["real_used"] = False
         return synth, False
     idx = synth.index.union(real.index).sort_values()
     synth_scaled = synth.reindex(idx).ffill()
@@ -333,6 +488,9 @@ def build_qqq5_hybrid_from_base(qqq_close, start=None, end=None):
     switch = real.first_valid_index()
     if switch is None:
         print('Warning: QQQ5 live prices missing valid entries; using synthetic series only.')
+        synth.attrs["source"] = "synthetic"
+        synth.attrs["synthetic_used"] = True
+        synth.attrs["real_used"] = False
         return synth, False
     synth_value = synth_scaled.loc[switch]
     real_value = real.loc[switch]
@@ -343,11 +501,20 @@ def build_qqq5_hybrid_from_base(qqq_close, start=None, end=None):
     hybrid = synth_scaled.copy()
     hybrid.loc[switch:] = real.loc[switch:].fillna(synth_scaled.loc[switch:])
     hybrid.name = 'QQQ5'
+    source = "real_market" if len(idx[idx < switch]) == 0 else "hybrid"
+    hybrid.attrs["source"] = source
+    hybrid.attrs["synthetic_used"] = source == "hybrid"
+    hybrid.attrs["real_used"] = True
+    hybrid.attrs["real_ticker"] = ticker
+    hybrid.attrs["switch_date"] = str(switch.date()) if hasattr(switch, "date") else str(switch)
     try:
         switch_date = switch.date()
     except AttributeError:
         switch_date = switch
-    print(f"QQQ5 hybrid uses live data starting {switch_date} from {ticker}.")
+    if source == "hybrid":
+        print(f"QQQ5 hybrid uses live data starting {switch_date} from {ticker}.")
+    else:
+        print(f"QQQ5 live market data starts at requested window from {ticker}.")
     return hybrid, True
 # ------------------ Feature Engineering (for DL) ------------------
 def create_technical_features(df, window=20):
@@ -448,8 +615,9 @@ def create_deep_learning_model(input_dim: int):
     if TORCH_AVAILABLE and TORCH_DEVICE is not None and torch is not None:
         model = model.to(TORCH_DEVICE)
     return model
-def train_deep_learning_model(df, features, look_ahead=5, prev_thresholds=None, ema_alpha=0.2,
-                              crash_tail_frac=0.05):
+def train_deep_learning_model(df, features, look_ahead=DL_DEFAULT_LOOK_AHEAD, prev_thresholds=None, ema_alpha=0.2,
+                              crash_tail_frac=0.05, crash_look=DL_DEFAULT_CRASH_LOOK,
+                              max_train_date=None):
     """
     Crash-aware 版本的深度学习训练函数：
     - 仍然使用未来 look_ahead 天的 TQQQ 风险调整收益 score 进行三分类（差 / 中性 / 好）。
@@ -460,17 +628,22 @@ def train_deep_learning_model(df, features, look_ahead=5, prev_thresholds=None, 
     - 同时对最坏类别（class 0）再额外提高 class_weight，让模型更重视“提前识别大跌区间”。
     返回值和调用方式保持不变。
     """
-    crash_look = 25  # trading days for crash severity / label
     if not DL_AVAILABLE or StandardScaler is None or not TORCH_AVAILABLE or torch is None:
         return None
+    if max_train_date is not None:
+        max_train_ts = pd.Timestamp(max_train_date)
+        df = df.loc[:max_train_ts].copy()
+        features = features.reindex(df.index).copy()
+    crash_look = int(crash_look)
+    label_buffer = dl_label_buffer_days(look_ahead, crash_look)
 
     t_ret = df['TQQQ'].pct_change()
     fut_ret = df['TQQQ'].pct_change(look_ahead).shift(-look_ahead)
     fut_vol = t_ret.rolling(look_ahead).std().shift(-look_ahead) * np.sqrt(252.0)
     score = fut_ret / (fut_vol.replace(0, 1e-8) + 1e-8)
     score = score.replace([np.inf, -np.inf], np.nan)
-    if look_ahead > 0 and len(score) > look_ahead:
-        score.iloc[-look_ahead:] = np.nan
+    if label_buffer > 0 and len(score) > 0:
+        score.iloc[-min(label_buffer, len(score)):] = np.nan
 
     prices = pd.to_numeric(df['TQQQ'], errors='coerce')
     min_dd = pd.Series(np.nan, index=prices.index)
@@ -937,8 +1110,177 @@ def compute_effective_leverage_from_weights(weights_df):
     w_tqqq = float(latest.get('w_tqqq', 0.0))
     w_qqq5 = float(latest.get('w_qqq5', 0.0))
     L_base = float(latest.get('L_base', 0.0))
-    eff = w_fut * L_base + 3.0 * w_tqqq + 5.0 * w_qqq5
+    if 'effective_leverage' in latest.index:
+        eff = float(latest.get('effective_leverage', np.nan))
+    else:
+        eff = compute_effective_leverage_components(w_fut, w_tqqq, w_qqq5, L_base)['effective_leverage']
     return asof, eff
+
+
+def compute_effective_leverage_components(w_fut, w_tqqq, w_qqq5, L_base):
+    fut_beta = max(float(L_base), 0.0) * max(float(w_fut), 0.0)
+    tqqq_beta = 3.0 * max(float(w_tqqq), 0.0)
+    qqq5_beta = 5.0 * max(float(w_qqq5), 0.0)
+    return {
+        'fut_beta': fut_beta,
+        'tqqq_beta': tqqq_beta,
+        'qqq5_beta': qqq5_beta,
+        'effective_leverage': fut_beta + tqqq_beta + qqq5_beta,
+    }
+
+
+def _effective_leverage_cap_enabled(max_effective_leverage):
+    try:
+        cap = float(max_effective_leverage)
+    except Exception:
+        return False
+    return bool(np.isfinite(cap) and cap > 0.0)
+
+
+def _normalize_weights_for_cash_policy(w_fut, w_tqqq, w_qqq5, preserve_cash=False):
+    w_fut = max(float(w_fut), 0.0)
+    w_tqqq = max(float(w_tqqq), 0.0)
+    w_qqq5 = max(float(w_qqq5), 0.0)
+    tot = w_fut + w_tqqq + w_qqq5
+    if tot <= 0.0:
+        return w_fut, w_tqqq, w_qqq5
+    if preserve_cash:
+        return w_fut, w_tqqq, w_qqq5
+    if tot > 1.0 + 1e-10 or (not preserve_cash and abs(tot - 1.0) > 1e-10):
+        return w_fut / tot, w_tqqq / tot, w_qqq5 / tot
+    return w_fut, w_tqqq, w_qqq5
+
+
+def enforce_effective_leverage_cap(
+    w_fut,
+    w_tqqq,
+    w_qqq5,
+    L_base,
+    max_effective_leverage,
+    book_trade_fn=None,
+    notes_callback=None,
+):
+    w_fut = max(float(w_fut), 0.0)
+    w_tqqq = max(float(w_tqqq), 0.0)
+    w_qqq5 = max(float(w_qqq5), 0.0)
+    L_base = max(float(L_base), 0.0)
+    pre_eff = compute_effective_leverage_components(w_fut, w_tqqq, w_qqq5, L_base)['effective_leverage']
+
+    if not _effective_leverage_cap_enabled(max_effective_leverage):
+        return {
+            'w_fut': w_fut,
+            'w_tqqq': w_tqqq,
+            'w_qqq5': w_qqq5,
+            'L_base': L_base,
+            'cap_hit': False,
+            'pre_eff': pre_eff,
+            'post_eff': pre_eff,
+        }
+
+    cap = float(max_effective_leverage)
+    eps = 1e-10
+    cap_hit = bool(pre_eff > cap + eps)
+
+    def current_eff():
+        return compute_effective_leverage_components(w_fut, w_tqqq, w_qqq5, L_base)['effective_leverage']
+
+    def trim_sleeve(frm, beta_per_weight, amount):
+        nonlocal w_fut, w_tqqq, w_qqq5
+        cut = max(0.0, min(float(amount), {'FUT': w_fut, 'TQQQ': w_tqqq, 'QQQ5': w_qqq5}[frm]))
+        if cut <= eps:
+            return 0.0
+        moved = None
+        if book_trade_fn is not None:
+            try:
+                moved = book_trade_fn(frm, 'CASH', cut)
+            except Exception:
+                moved = None
+        if moved is None:
+            moved = cut
+        moved = max(0.0, min(float(moved), cut))
+        if moved <= eps:
+            return 0.0
+        if frm == 'FUT':
+            w_fut = max(0.0, w_fut - moved)
+        elif frm == 'TQQQ':
+            w_tqqq = max(0.0, w_tqqq - moved)
+        elif frm == 'QQQ5':
+            w_qqq5 = max(0.0, w_qqq5 - moved)
+        return moved * float(beta_per_weight)
+
+    def trim_for_weight_sum(frm):
+        weight_sum = w_fut + w_tqqq + w_qqq5
+        if weight_sum <= 1.0 + eps:
+            return
+        excess_weight = weight_sum - 1.0
+        beta = L_base if frm == 'FUT' else 3.0 if frm == 'TQQQ' else 5.0
+        trim_sleeve(frm, beta, excess_weight)
+
+    if cap_hit or (w_fut + w_tqqq + w_qqq5) > 1.0 + eps:
+        for frm in ('QQQ5', 'TQQQ'):
+            beta = 5.0 if frm == 'QQQ5' else 3.0
+            if current_eff() > cap + eps:
+                need = (current_eff() - cap) / beta
+                trim_sleeve(frm, beta, need)
+            trim_for_weight_sum(frm)
+
+        if current_eff() > cap + eps and w_fut > eps:
+            non_fut_beta = 3.0 * w_tqqq + 5.0 * w_qqq5
+            allowed_fut_beta = max(0.0, cap - non_fut_beta)
+            new_L_base = allowed_fut_beta / max(w_fut, eps)
+            L_base = min(L_base, max(0.0, new_L_base))
+
+        if current_eff() > cap + eps and L_base > eps:
+            need = (current_eff() - cap) / L_base
+            trim_sleeve('FUT', L_base, need)
+        trim_for_weight_sum('FUT')
+
+    post_eff = current_eff()
+    if notes_callback is not None and cap_hit:
+        try:
+            notes_callback(
+                f"effective_leverage_cap_hit(pre_eff={pre_eff:.4f}, post_eff={post_eff:.4f})"
+            )
+        except Exception:
+            pass
+    return {
+        'w_fut': w_fut,
+        'w_tqqq': w_tqqq,
+        'w_qqq5': w_qqq5,
+        'L_base': L_base,
+        'cap_hit': cap_hit,
+        'pre_eff': pre_eff,
+        'post_eff': post_eff,
+    }
+
+
+def effective_leverage_report_stats(weights_df, max_effective_leverage, cap_hits):
+    enabled = _effective_leverage_cap_enabled(max_effective_leverage)
+    cap = float(max_effective_leverage) if enabled else np.nan
+    if weights_df is None or len(weights_df) == 0:
+        lev = pd.Series(dtype=float)
+    elif 'effective_leverage' in weights_df.columns:
+        lev = pd.to_numeric(weights_df['effective_leverage'], errors='coerce').dropna()
+    else:
+        lev = weights_df.apply(
+            lambda row: compute_effective_leverage_components(
+                row.get('w_fut', 0.0),
+                row.get('w_tqqq', 0.0),
+                row.get('w_qqq5', 0.0),
+                row.get('L_base', 0.0),
+            )['effective_leverage'],
+            axis=1,
+        ).dropna()
+    max_eff = float(lev.max()) if len(lev) else float('nan')
+    return {
+        'EffectiveLeverageCap': cap,
+        'EffectiveLeverageCapEnabled': bool(enabled),
+        'EffectiveLeverageCapHits': int(cap_hits or 0),
+        'AvgEffectiveLeverage': float(lev.mean()) if len(lev) else float('nan'),
+        'MaxEffectiveLeverage': max_eff,
+        'P95EffectiveLeverage': float(lev.quantile(0.95)) if len(lev) else float('nan'),
+        'EffectiveLeverageCap_MaxViolation': max(0.0, max_eff - cap) if enabled and np.isfinite(max_eff) else 0.0,
+    }
 
 # ------------------ Baseline (non-DL) backtest with PolicyBrain ------------------
 def baseline_backtest(df,
@@ -977,7 +1319,17 @@ def baseline_backtest(df,
                       adv_daily_frac_cap=0.10,
                       metrics_csv_path=None,
                       crash_mode="soft_scale",
-                      crash_tail_frac=0.05):
+                      crash_tail_frac=0.05,
+                      initial_w_fut=1.0,
+                      initial_w_tqqq=0.0,
+                      initial_w_qqq5=0.0,
+                      initial_L_base=0.0,
+                      deduct_tqqq_expense_in_returns=False,
+                      deduct_qqq5_expense_in_returns=False,
+                      max_effective_leverage=None,
+                      disable_qqq5=False,
+                      allow_synthetic_qqq5=False,
+                      qqq5_source=None):
 
     crash_mode = (crash_mode or "soft_scale").lower()
     if crash_mode not in {"none", "monitor_only", "hard_cap", "soft_scale"}:
@@ -985,13 +1337,25 @@ def baseline_backtest(df,
     px = df.copy()
     ret = px.pct_change().fillna(0.0)
     idx = px.index
+    qqq5_policy = resolve_qqq5_policy(
+        px,
+        qqq5_source=qqq5_source,
+        disable_qqq5=disable_qqq5,
+        allow_synthetic_qqq5=allow_synthetic_qqq5,
+    )
+    qqq5_allowed = bool(qqq5_policy["allowed"])
     # policy 初始化
     d_ctx = 9  # compute_context_vector 的特征维度
     brain = PolicyBrain(d=d_ctx, alpha=bandit_alpha, enable=(policy_mode=='bandit'), use_risk_gate=use_risk_gate)
     vix_aligned = None
     if vix_series is not None:
         vix_aligned = pd.to_numeric(vix_series, errors='coerce').reindex(px.index).ffill().bfill()
-    w_fut, w_tqqq, w_qqq5 = 1.0, 0.0, 0.0
+    w_fut, w_tqqq, w_qqq5 = float(initial_w_fut), float(initial_w_tqqq), float(initial_w_qqq5)
+    if not qqq5_allowed:
+        w_qqq5 = 0.0
+    init_tot = w_fut + w_tqqq + w_qqq5
+    if init_tot > 0 and abs(init_tot - 1.0) > 1e-10:
+        w_fut, w_tqqq, w_qqq5 = w_fut/init_tot, w_tqqq/init_tot, w_qqq5/init_tot
     equity = [1.0]
     w_records, trades, debug_notes = [], [], []
     qqq, tqqq, qqq5 = px['QQQ'], px['TQQQ'], px['QQQ5']
@@ -999,7 +1363,8 @@ def baseline_backtest(df,
     tqqq_ath_global = tqqq.iloc[0]; qqq5_ath_global = qqq5.iloc[0]
     next_upstep_level = None
     added_qqq5_steps = 0
-    L_base = 0.0; last_rebal_day = 0
+    L_base = float(initial_L_base); last_rebal_day = 0
+    pending_trade_cost = 0.0
     roll_mu = ret['QQQ'].rolling(kelly_lookback_days).mean()*252.0
     roll_sigma = ret['QQQ'].rolling(kelly_lookback_days).std()*np.sqrt(252.0)
     roll_mu_full = ret['QQQ'].expanding().mean()*252.0
@@ -1036,10 +1401,35 @@ def baseline_backtest(df,
     crash_cap_hit_flag = 0
     qqq5_cap_hit_flag = 0
     L_base_pre_crash = 0.0
+    effective_leverage_cap_hits = 0
 
     for i in range(1, len(idx)):
         d = idx[i]
         day_traded_notional = {'TQQQ': 0.0, 'QQQ5': 0.0}
+        prev_w_fut = float(w_fut)
+        prev_w_tqqq = float(w_tqqq)
+        prev_w_qqq5 = float(w_qqq5)
+        prev_L_base = float(L_base)
+
+        # Day-t PnL uses only positions/leverage fixed after day t-1 close.
+        # Costs generated by the prior close target are charged at today's open.
+        rf_for_pnl = get_rf_value_for_date(rf_series, idx[i-1], rf_ann)
+        r_q = ret['QQQ'].iloc[i]
+        r_t3 = ret['TQQQ'].iloc[i]
+        if deduct_tqqq_expense_in_returns:
+            r_t3 -= (tqqq_expense/252.0)
+        r_q5 = ret['QQQ5'].iloc[i]
+        if deduct_qqq5_expense_in_returns:
+            r_q5 -= (qqq5_expense/252.0)
+        applied_trade_cost = float(pending_trade_cost)
+        pending_trade_cost = 0.0
+        prev_eq = max(equity[-1] - applied_trade_cost, 1e-12)
+        fut_fin_drag = (rf_for_pnl + fut_fin_spread) * max(prev_L_base-1.0, 0.0)/252.0
+        r_fut = prev_L_base * r_q - fut_fin_drag
+        new_eq = prev_eq * (1.0 + prev_w_fut*r_fut + prev_w_tqqq*r_t3 + prev_w_qqq5*r_q5)
+        new_eq = max(new_eq, 1e-12)
+        equity.append(new_eq)
+
         # ATH / DD
         if qqq.iloc[i] > qqq_ath: qqq_ath = qqq.iloc[i]
         drawdown = (qqq.iloc[i]/qqq_ath) - 1.0
@@ -1061,6 +1451,8 @@ def baseline_backtest(df,
                 vix_today = None
         regime_score = compute_regime_score(mom21, mom63, vix_today if vix_today is not None else 20.0)
         cap_qqq5 = max(0.0, min(dl_max_qqq5 + 0.20*regime_score, 0.50))
+        if not qqq5_allowed:
+            cap_qqq5 = 0.0
         cap_tqqq = max(0.0, min(dl_max_tqqq + 0.30*regime_score, 0.95))
         # 周期 Kelly 更新 + policy 决策
         notes_today = f"risk={int(risk_flag)}"
@@ -1116,23 +1508,16 @@ def baseline_backtest(df,
             # 非再平衡日，沿用上次 decision；policy=none 时保持静态触发值
             if policy_mode == 'none':
                 triggers_live = static_triggers
-        # Returns + costs
-        r_q  = ret['QQQ'].iloc[i]
-        r_t3 = ret['TQQQ'].iloc[i] - (tqqq_expense/252.0)
-        r_q5 = ret['QQQ5'].iloc[i] - (qqq5_expense/252.0)
-        fut_fin_drag = (rf_today + fut_fin_spread) * max(L_base-1.0, 0.0)/252.0
         allow_aggressive = (regime_score > 0.25) and (mom3 > -0.002) and (mom10 > 0.0)
-        r_fut = L_base * r_q - fut_fin_drag
-        prev_eq = equity[-1]
-        new_eq = prev_eq * (1.0 + w_fut*r_fut + w_tqqq*r_t3 + w_qqq5*r_q5)
-        new_eq = max(new_eq, 1e-12)
-        equity.append(new_eq)
         def book_trade(frm,to,frac):
-            nonlocal w_fut,w_tqqq,w_qqq5, notes_today
+            nonlocal w_fut,w_tqqq,w_qqq5, notes_today, pending_trade_cost
             def available_cash():
                 return max(0.0, 1.0 - (w_fut + w_tqqq + w_qqq5))
             frac = max(0.0, min(frac, 1.0))
             if frac <= 0: return 0.0
+            if to == 'QQQ5' and not qqq5_allowed:
+                notes_today = f"{notes_today} | qqq5_not_allowed" if notes_today else "qqq5_not_allowed"
+                return 0.0
             moved = 0.0
             target_sleeve = to if to in ('TQQQ','QQQ5') else None
             if target_sleeve is not None and adv_daily_frac_cap > 0:
@@ -1160,6 +1545,11 @@ def baseline_backtest(df,
                     amt=min(w_tqqq, frac); w_tqqq-=amt; w_fut+=amt; moved=amt
                 else:
                     amt=min(w_qqq5, frac); w_qqq5-=amt; w_fut+=amt; moved=amt
+            elif frm in ('TQQQ','QQQ5') and to=='CASH':
+                if frm=='TQQQ':
+                    amt=min(w_tqqq, frac); w_tqqq-=amt; moved=amt
+                else:
+                    amt=min(w_qqq5, frac); w_qqq5-=amt; moved=amt
             elif frm=='FUT' and to=='CASH':
                 amt=min(w_fut, frac); w_fut-=amt; moved=amt
             elif frm=='CASH' and to=='FUT':
@@ -1187,9 +1577,12 @@ def baseline_backtest(df,
                         cost += impact_frac * dollar_trade
                 except Exception:
                     pass
-                equity[-1] = max(equity[-1]-cost, 1e-12)
+                pending_trade_cost += float(cost)
                 trades.append((d, frm, to, moved, cost))
             return moved
+        if not qqq5_allowed and w_qqq5 > 1e-8:
+            notes_today = f"{notes_today} | qqq5_forced_exit" if notes_today else "qqq5_forced_exit"
+            book_trade('QQQ5', 'FUT', w_qqq5)
         def enforce_crash_caps():
             nonlocal w_fut, w_tqqq, w_qqq5, L_base, crash_cap_hit_flag, qqq5_cap_hit_flag, notes_today
             def leverage_with_base(base):
@@ -1307,17 +1700,37 @@ def baseline_backtest(df,
             crash_cap_hit_flag = 0
             qqq5_cap_hit_flag = 0
         enforce_caps()
-        # Normalize
-        tot = w_fut + w_tqqq + w_qqq5
-        if tot > 0 and abs(tot-1.0) > 1e-10:
-            w_fut, w_tqqq, w_qqq5 = w_fut/tot, w_tqqq/tot, w_qqq5/tot
-        w_records.append((d, w_fut, w_tqqq, w_qqq5, L_base, kelly_frac_live))
+        w_fut, w_tqqq, w_qqq5 = _normalize_weights_for_cash_policy(
+            w_fut,
+            w_tqqq,
+            w_qqq5,
+            preserve_cash=_effective_leverage_cap_enabled(max_effective_leverage),
+        )
+        def _note_effective_cap(note):
+            nonlocal notes_today
+            notes_today = f"{notes_today} | {note}" if notes_today else note
+        cap_result = enforce_effective_leverage_cap(
+            w_fut,
+            w_tqqq,
+            w_qqq5,
+            L_base,
+            max_effective_leverage,
+            book_trade_fn=book_trade,
+            notes_callback=_note_effective_cap,
+        )
+        w_fut = cap_result['w_fut']
+        w_tqqq = cap_result['w_tqqq']
+        w_qqq5 = cap_result['w_qqq5']
+        L_base = cap_result['L_base']
+        if cap_result['cap_hit']:
+            effective_leverage_cap_hits += 1
+        effective_leverage_today = cap_result['post_eff']
+        w_records.append((d, w_fut, w_tqqq, w_qqq5, L_base, kelly_frac_live, effective_leverage_today))
         cur_eq = equity[-1]
         positions_records.append((d, cur_eq, w_fut*cur_eq, w_tqqq*cur_eq, w_qqq5*cur_eq, L_base, kelly_frac_live))
         debug_notes.append((d, notes_today, crash_mode, crash_tail_frac))
         daily_ret = float(equity[-1]/equity[-2] - 1.0) if len(equity) >= 2 else 0.0
         cum_max = max(equity)
-        effective_leverage_today = float(w_fut * L_base + 3.0*w_tqqq + 5.0*w_qqq5)
         metrics = {
             "date": d.strftime("%Y-%m-%d"),
             "mode": "baseline",
@@ -1344,7 +1757,7 @@ def baseline_backtest(df,
             "num_trades": int(locals().get('day_trades', 0)),
             "turnover": float(locals().get('day_turnover', 0.0)),
             "realized_pnl": float(locals().get('day_realized_pnl', 0.0)),
-            "fees_and_costs": float(locals().get('day_costs', 0.0)),
+            "fees_and_costs": float(applied_trade_cost + locals().get('day_costs', 0.0)),
             "comment": str(locals().get('notes_today', "")),
         }
         if metrics_csv_path:
@@ -1357,7 +1770,14 @@ def baseline_backtest(df,
             penalty = 0.005
         brain.record_reward(day_ret - penalty)
     equity = pd.Series(equity, index=px.index, name='Equity')
-    weights_df = pd.DataFrame(w_records, columns=['Date','w_fut','w_tqqq','w_qqq5','L_base','kelly_frac']).set_index('Date')
+    weights_df = pd.DataFrame(
+        w_records,
+        columns=['Date','w_fut','w_tqqq','w_qqq5','L_base','kelly_frac','effective_leverage']
+    ).set_index('Date')
+    weights_df.attrs["timing"] = (
+        "Rows are end-of-day target weights decided after that date's close; "
+        "they are applied to the next trading day's PnL."
+    )
     notes_df = pd.DataFrame(
         debug_notes,
         columns=['Date','Notes','crash_mode','crash_tail_frac']
@@ -1377,7 +1797,11 @@ def baseline_backtest(df,
     sharpe = cagr/vol if vol>1e-8 else float('nan')
     calmar = cagr/abs(maxdd) if maxdd<0 else float('nan')
     # TQQQ buy&hold
-    t_ret = px['TQQQ'].pct_change().fillna(0.0) - (tqqq_expense/252.0)
+    t_ret = apply_expense_to_returns(
+        px['TQQQ'].pct_change().fillna(0.0),
+        tqqq_expense,
+        deduct_tqqq_expense_in_returns,
+    )
     t_eq = (1+t_ret).cumprod()
     t_cagr = t_eq.iloc[-1]**(1/years) - 1.0
     t_vol = t_ret.std()*np.sqrt(252.0)
@@ -1391,6 +1815,17 @@ def baseline_backtest(df,
         'TQQQ_CAGR': t_cagr, 'TQQQ_Vol': t_vol, 'TQQQ_Sharpe': t_sharpe,
         'TQQQ_MaxDD': t_mdd, 'TQQQ_Calmar': t_calmar, 'TQQQ_Final_Equity': t_eq.iloc[-1]
     }
+    report.update(_price_meta_for_report(
+        px,
+        deduct_tqqq_expense_in_returns=deduct_tqqq_expense_in_returns,
+        deduct_qqq5_expense_in_returns=deduct_qqq5_expense_in_returns,
+    ))
+    report.update(qqq5_policy_report_stats(weights_df, trades_df, qqq5_policy))
+    report.update(effective_leverage_report_stats(
+        weights_df,
+        max_effective_leverage,
+        effective_leverage_cap_hits,
+    ))
     eff_asof, eff_val = compute_effective_leverage_from_weights(weights_df)
     if np.isfinite(eff_val):
         report['Effective_Leverage_Today'] = eff_val
@@ -1417,8 +1852,11 @@ def ma_crossover_backtest(df,
                           fast=5,
                           slow=20,
                           tqqq_expense=0.009,
+                          qqq5_expense=0.0095,
                           trade_cost_bps=1.0,
-                          slip_bps=1.0):
+                          slip_bps=1.0,
+                          deduct_tqqq_expense_in_returns=False,
+                          deduct_qqq5_expense_in_returns=False):
     """
     Long TQQQ when fast MA > slow MA; otherwise sit in cash.
     Position is applied on the next bar (no lookahead).
@@ -1426,7 +1864,11 @@ def ma_crossover_backtest(df,
     px = df.copy()
     t = pd.to_numeric(px['TQQQ'], errors='coerce')
     idx = t.index
-    ret_tqqq = t.pct_change().fillna(0.0) - (tqqq_expense / 252.0)
+    ret_tqqq = apply_expense_to_returns(
+        t.pct_change().fillna(0.0),
+        tqqq_expense,
+        deduct_tqqq_expense_in_returns,
+    )
     ma_fast = t.rolling(fast).mean()
     ma_slow = t.rolling(slow).mean()
     signal = (ma_fast > ma_slow).astype(float)
@@ -1494,6 +1936,11 @@ def ma_crossover_backtest(df,
         'TQQQ_CAGR': t_cagr, 'TQQQ_Vol': t_vol, 'TQQQ_Sharpe': t_sharpe,
         'TQQQ_MaxDD': t_mdd, 'TQQQ_Calmar': t_calmar, 'TQQQ_Final_Equity': t_eq.iloc[-1]
     }
+    report.update(_price_meta_for_report(
+        px,
+        deduct_tqqq_expense_in_returns=deduct_tqqq_expense_in_returns,
+        deduct_qqq5_expense_in_returns=deduct_qqq5_expense_in_returns,
+    ))
     return equity, dd, report, weights_df, trades_df, t_eq, notes_df, positions_df, None, None
 # ------------------ DL-enhanced backtest with the same PolicyBrain hooks ------------------
 def validate_initial_train_end_for_dl(initial_train_end):
@@ -1502,6 +1949,13 @@ def validate_initial_train_end_for_dl(initial_train_end):
             "initial_train_end is required for DL backtests; refusing to train on the full df."
         )
     return pd.Timestamp(initial_train_end)
+
+
+def _safe_dl_training_window(df, features, stop_pos_exclusive):
+    stop_pos = max(0, min(int(stop_pos_exclusive), len(df)))
+    train_df = df.iloc[:stop_pos].copy()
+    train_feat = features.reindex(train_df.index).copy()
+    return train_df, train_feat
 
 
 def deep_learning_backtest(df,
@@ -1541,7 +1995,17 @@ def deep_learning_backtest(df,
                            adv_daily_frac_cap=0.10,
                            metrics_csv_path=None,
                            crash_mode="soft_scale",
-                           crash_tail_frac=0.05):
+                           crash_tail_frac=0.05,
+                           initial_w_fut=1.0,
+                           initial_w_tqqq=0.0,
+                           initial_w_qqq5=0.0,
+                           initial_L_base=0.0,
+                           deduct_tqqq_expense_in_returns=False,
+                           deduct_qqq5_expense_in_returns=False,
+                           max_effective_leverage=None,
+                           disable_qqq5=False,
+                           allow_synthetic_qqq5=False,
+                           qqq5_source=None):
 
     initial_train_end_ts = validate_initial_train_end_for_dl(initial_train_end)
     crash_mode = (crash_mode or "soft_scale").lower()
@@ -1550,24 +2014,34 @@ def deep_learning_backtest(df,
     px = df.copy()
     ret = px.pct_change().fillna(0.0)
     idx = px.index
+    qqq5_policy = resolve_qqq5_policy(
+        px,
+        qqq5_source=qqq5_source,
+        disable_qqq5=disable_qqq5,
+        allow_synthetic_qqq5=allow_synthetic_qqq5,
+    )
+    qqq5_allowed = bool(qqq5_policy["allowed"])
     features = create_technical_features(df)
     model, scaler, predict_fn, dl_stats = (None, None, None, None)
     dl_retrain_log = []
+    dl_label_buffer = dl_label_buffer_days()
     if DL_AVAILABLE:
-        train_df = df.loc[:initial_train_end_ts]
+        initial_cutoff_pos = int(np.searchsorted(idx, initial_train_end_ts, side="right") - 1)
+        initial_stop = initial_cutoff_pos + 1 - dl_label_buffer
+        train_df, train_feat = _safe_dl_training_window(df, features, initial_stop)
         if len(train_df) < 252 * 4:
             print(
                 "DL: initial training skipped; "
                 f"initial_train_end={initial_train_end_ts.date()} leaves only "
-                f"{len(train_df)} samples (< {252 * 4}). Using rule logic until retrain succeeds."
+                f"{len(train_df)} leak-safe samples (< {252 * 4}). Using rule logic until retrain succeeds."
             )
         else:
-            train_feat = features.loc[train_df.index]
             init = train_deep_learning_model(
                 train_df,
                 train_feat,
                 prev_thresholds=None,
-                crash_tail_frac=crash_tail_frac
+                crash_tail_frac=crash_tail_frac,
+                max_train_date=train_df.index[-1]
             )
             if init:
                 model, scaler, predict_fn, dl_stats = init
@@ -1577,7 +2051,7 @@ def deep_learning_backtest(df,
                     cr = dl_stats.get("class_returns", [np.nan, np.nan, np.nan])
                     cs = dl_stats.get("class_scores", [np.nan, np.nan, np.nan])
                     cc = dl_stats.get("class_counts", [0, 0, 0])
-                    dl_retrain_log.append([idx[0], th[0], th[1], *(cr or []), *(cs or []), *(cc or [])])
+                    dl_retrain_log.append([initial_train_end_ts, th[0], th[1], *(cr or []), *(cs or []), *(cc or [])])
             else:
                 print("DL: initial training unavailable; will use rule logic until retrain succeeds.")
     else:
@@ -1588,7 +2062,12 @@ def deep_learning_backtest(df,
     vix_aligned = None
     if vix_series is not None:
         vix_aligned = pd.to_numeric(vix_series, errors='coerce').reindex(px.index).ffill().bfill()
-    w_fut, w_tqqq, w_qqq5 = 1.0, 0.0, 0.0
+    w_fut, w_tqqq, w_qqq5 = float(initial_w_fut), float(initial_w_tqqq), float(initial_w_qqq5)
+    if not qqq5_allowed:
+        w_qqq5 = 0.0
+    init_tot = w_fut + w_tqqq + w_qqq5
+    if init_tot > 0 and abs(init_tot - 1.0) > 1e-10:
+        w_fut, w_tqqq, w_qqq5 = w_fut/init_tot, w_tqqq/init_tot, w_qqq5/init_tot
     equity = [1.0]
     w_records, trades, debug_notes = [], [], []
     qqq, tqqq, qqq5 = px['QQQ'], px['TQQQ'], px['QQQ5']
@@ -1596,7 +2075,8 @@ def deep_learning_backtest(df,
     tqqq_ath_global = tqqq.iloc[0]; qqq5_ath_global = qqq5.iloc[0]
     next_upstep_level = None
     added_qqq5_steps = 0
-    L_base = 0.0; last_rebal_day = 0; last_retrain_day = -10**9
+    L_base = float(initial_L_base); last_rebal_day = 0; last_retrain_day = -10**9
+    pending_trade_cost = 0.0
     roll_mu = ret['QQQ'].rolling(kelly_lookback_days).mean()*252.0
     roll_sigma = ret['QQQ'].rolling(kelly_lookback_days).std()*np.sqrt(252.0)
     roll_mu_full = ret['QQQ'].expanding().mean()*252.0
@@ -1617,6 +2097,7 @@ def deep_learning_backtest(df,
     crash_severe_fallback = 0.78
     crash_mild_caps = (1.8, 0.10)
     crash_severe_caps = (1.5, 0.0)
+    effective_leverage_cap_hits = 0
     def _adv_for(sleeve, date):
         ser = adv_series_tqqq if sleeve == 'TQQQ' else adv_series_qqq5 if sleeve == 'QQQ5' else None
         if ser is None:
@@ -1639,6 +2120,30 @@ def deep_learning_backtest(df,
     for i in range(1, len(idx)):
         d = idx[i]
         day_traded_notional = {'TQQQ': 0.0, 'QQQ5': 0.0}
+        prev_w_fut = float(w_fut)
+        prev_w_tqqq = float(w_tqqq)
+        prev_w_qqq5 = float(w_qqq5)
+        prev_L_base = float(L_base)
+        # Day-t PnL uses only positions/leverage fixed after day t-1 close.
+        # Costs generated by the prior close target are charged at today's open.
+        rf_for_pnl = get_rf_value_for_date(rf_series, idx[i-1], rf_ann)
+        r_q = ret['QQQ'].iloc[i]
+        r_t3 = ret['TQQQ'].iloc[i]
+        if deduct_tqqq_expense_in_returns:
+            r_t3 -= (tqqq_expense/252.0)
+        r_q5 = ret['QQQ5'].iloc[i]
+        if deduct_qqq5_expense_in_returns:
+            r_q5 -= (qqq5_expense/252.0)
+        applied_trade_cost = float(pending_trade_cost)
+        pending_trade_cost = 0.0
+        prev_eq = max(equity[-1] - applied_trade_cost, 1e-12)
+        fut_fin_drag = (rf_for_pnl + fut_fin_spread) * max(prev_L_base-1.0, 0.0)/252.0
+        r_fut = prev_L_base * r_q - fut_fin_drag
+        new_eq = prev_eq*(1.0 + prev_w_fut*r_fut + prev_w_tqqq*r_t3 + prev_w_qqq5*r_q5)
+        new_eq = max(new_eq, 1e-12)
+        equity.append(new_eq)
+
+        dl_live = pd.Timestamp(d) > initial_train_end_ts
         risk_cooldown_left = max(0, risk_cooldown_left - 1)
         # ATH / DD
         if qqq.iloc[i] > qqq_ath: qqq_ath = qqq.iloc[i]
@@ -1661,6 +2166,8 @@ def deep_learning_backtest(df,
                 vix_today = None
         regime_score = compute_regime_score(mom21, mom63, vix_today if vix_today is not None else 20.0)
         cap_qqq5 = max(0.0, min(dl_max_qqq5 + 0.40*regime_score, 0.75))
+        if not qqq5_allowed:
+            cap_qqq5 = 0.0
         cap_tqqq = max(0.0, min(dl_max_tqqq + 0.50*regime_score, 1.30))
         crash_prob = None
         crash_L_cap = None
@@ -1719,19 +2226,24 @@ def deep_learning_backtest(df,
             last_rebal_day = i
             notes_today = f"{decision['notes']}, risk={int(risk_flag)}, cooldown={risk_cooldown_left}"
             # DL 滚动再训练（最多 500 日窗口）
-            if DL_AVAILABLE and i >= 252 and (i - last_retrain_day) >= rebalance_every_days:
-                start_idx = max(0, i - 500)
-                rec_feat = features.iloc[start_idx:i+1]
-                rec_df = df.iloc[start_idx:i+1]
-                prev_th = None
-                if dl_stats is not None:
-                    prev_th = dl_stats.get("thresholds")
-                upd = train_deep_learning_model(
-                    rec_df,
-                    rec_feat,
-                    prev_thresholds=prev_th,
-                    crash_tail_frac=crash_tail_frac
-                )
+            if DL_AVAILABLE and dl_live and i >= 252 and (i - last_retrain_day) >= rebalance_every_days:
+                safe_stop = i - dl_label_buffer
+                start_idx = max(0, safe_stop - 500)
+                if safe_stop <= start_idx:
+                    upd = None
+                else:
+                    rec_df = df.iloc[start_idx:safe_stop].copy()
+                    rec_feat = features.reindex(rec_df.index).copy()
+                    prev_th = None
+                    if dl_stats is not None:
+                        prev_th = dl_stats.get("thresholds")
+                    upd = train_deep_learning_model(
+                        rec_df,
+                        rec_feat,
+                        prev_thresholds=prev_th,
+                        crash_tail_frac=crash_tail_frac,
+                        max_train_date=rec_df.index[-1] if len(rec_df) else None
+                    )
                 if upd:
                     model, scaler, predict_fn, dl_stats = upd
                     th = dl_stats.get("thresholds", (np.nan, np.nan))
@@ -1744,23 +2256,16 @@ def deep_learning_backtest(df,
             if policy_mode == 'none':
                 triggers_live = static_triggers
         L_base_pre_crash = float(L_base)
-        # returns + costs
-        r_q  = ret['QQQ'].iloc[i]
-        r_t3 = ret['TQQQ'].iloc[i] - (tqqq_expense/252.0)
-        r_q5 = ret['QQQ5'].iloc[i] - (qqq5_expense/252.0)
-        fut_fin_drag = (rf_today + fut_fin_spread) * max(L_base-1.0, 0.0)/252.0
         allow_aggressive = (regime_score > 0.30) and (mom3 > -0.002) and (mom10 > 0.0)
-        r_fut = L_base * r_q - fut_fin_drag
-        prev_eq = equity[-1]
-        new_eq = prev_eq*(1.0 + w_fut*r_fut + w_tqqq*r_t3 + w_qqq5*r_q5)
-        new_eq = max(new_eq, 1e-12)
-        equity.append(new_eq)
         def book_trade(frm,to,frac):
-            nonlocal w_fut,w_tqqq,w_qqq5, notes_today
+            nonlocal w_fut,w_tqqq,w_qqq5, notes_today, pending_trade_cost
             def available_cash():
                 return max(0.0, 1.0 - (w_fut + w_tqqq + w_qqq5))
             frac = max(0.0, min(frac, 1.0))
             if frac <= 0: return 0.0
+            if to == 'QQQ5' and not qqq5_allowed:
+                notes_today = f"{notes_today} | qqq5_not_allowed" if notes_today else "qqq5_not_allowed"
+                return 0.0
             target_sleeve = to if to in ('TQQQ','QQQ5') else None
             if target_sleeve is not None and adv_daily_frac_cap > 0:
                 adv_today = _adv_for(target_sleeve, d)
@@ -1787,6 +2292,11 @@ def deep_learning_backtest(df,
                     amt=min(w_tqqq, frac); w_tqqq-=amt; w_fut+=amt; moved=amt
                 else:
                     amt=min(w_qqq5, frac); w_qqq5-=amt; w_fut+=amt; moved=amt
+            elif frm in ('TQQQ','QQQ5') and to=='CASH':
+                if frm=='TQQQ':
+                    amt=min(w_tqqq, frac); w_tqqq-=amt; moved=amt
+                else:
+                    amt=min(w_qqq5, frac); w_qqq5-=amt; moved=amt
             elif frm=='FUT' and to=='CASH':
                 amt=min(w_fut, frac); w_fut-=amt; moved=amt
             elif frm=='CASH' and to=='FUT':
@@ -1814,9 +2324,12 @@ def deep_learning_backtest(df,
                         cost += impact_frac * dollar_trade
                 except Exception:
                     pass
-                equity[-1] = max(equity[-1]-cost, 1e-12)
+                pending_trade_cost += float(cost)
                 trades.append((d, frm, to, moved, cost))
             return moved
+        if not qqq5_allowed and w_qqq5 > 1e-8:
+            notes_today = f"{notes_today} | qqq5_forced_exit" if notes_today else "qqq5_forced_exit"
+            book_trade('QQQ5', 'FUT', w_qqq5)
         def enforce_crash_caps():
             nonlocal w_fut, w_tqqq, w_qqq5, L_base, crash_cap_hit_flag, qqq5_cap_hit_flag, notes_today
             beta_for_calc = L_base_pre_crash if np.isfinite(L_base_pre_crash) else L_base
@@ -1871,7 +2384,7 @@ def deep_learning_backtest(df,
             L_cap_now = float('inf')
         vol_cap_block = np.isfinite(L_cap_now) and L_base >= 0.95 * L_cap_now
         dl_log = None
-        if model is not None and scaler is not None and predict_fn is not None and dl_stats is not None:
+        if dl_live and model is not None and scaler is not None and predict_fn is not None and dl_stats is not None:
             try:
                 cur_feat = features.loc[d].values.reshape(1, -1)
                 cur_scaled = scaler.transform(cur_feat).astype(np.float32, copy=False)
@@ -2003,6 +2516,8 @@ def deep_learning_backtest(df,
                             book_trade('FUT','TQQQ', move_from_f)
             except Exception:
                 dl_log = 'DL(action=error)'
+        elif not dl_live:
+            dl_log = f"DL(warmup_until={initial_train_end_ts.date()})"
         else:
             dl_log = 'DL(unavailable)'
         if dl_log:
@@ -2087,17 +2602,37 @@ def deep_learning_backtest(df,
         if risk_flag:
             risk_cooldown_left = int(max(1, dl_cooldown))
             notes_today = f"{notes_today} | cooldown_reset={risk_cooldown_left}"
-        # Normalize
-        tot = w_fut + w_tqqq + w_qqq5
-        if tot > 0 and abs(tot-1.0) > 1e-10:
-            w_fut, w_tqqq, w_qqq5 = w_fut/tot, w_tqqq/tot, w_qqq5/tot
-        w_records.append((d, w_fut, w_tqqq, w_qqq5, L_base, kelly_frac_live))
+        w_fut, w_tqqq, w_qqq5 = _normalize_weights_for_cash_policy(
+            w_fut,
+            w_tqqq,
+            w_qqq5,
+            preserve_cash=_effective_leverage_cap_enabled(max_effective_leverage),
+        )
+        def _note_effective_cap(note):
+            nonlocal notes_today
+            notes_today = f"{notes_today} | {note}" if notes_today else note
+        cap_result = enforce_effective_leverage_cap(
+            w_fut,
+            w_tqqq,
+            w_qqq5,
+            L_base,
+            max_effective_leverage,
+            book_trade_fn=book_trade,
+            notes_callback=_note_effective_cap,
+        )
+        w_fut = cap_result['w_fut']
+        w_tqqq = cap_result['w_tqqq']
+        w_qqq5 = cap_result['w_qqq5']
+        L_base = cap_result['L_base']
+        if cap_result['cap_hit']:
+            effective_leverage_cap_hits += 1
+        effective_leverage_today = cap_result['post_eff']
+        w_records.append((d, w_fut, w_tqqq, w_qqq5, L_base, kelly_frac_live, effective_leverage_today))
         cur_eq = equity[-1]
         positions_records.append((d, cur_eq, w_fut*cur_eq, w_tqqq*cur_eq, w_qqq5*cur_eq, L_base, kelly_frac_live))
         debug_notes.append((d, notes_today))
         daily_ret = float(equity[-1]/equity[-2] - 1.0) if len(equity) >= 2 else 0.0
         cum_max = max(equity)
-        effective_leverage_today = float(w_fut * L_base + 3.0*w_tqqq + 5.0*w_qqq5)
         metrics = {
             "date": d.strftime("%Y-%m-%d"),
             "mode": "dl",
@@ -2124,7 +2659,7 @@ def deep_learning_backtest(df,
             "num_trades": int(locals().get('day_trades', 0)),
             "turnover": float(locals().get('day_turnover', 0.0)),
             "realized_pnl": float(locals().get('day_realized_pnl', 0.0)),
-            "fees_and_costs": float(locals().get('day_costs', 0.0)),
+            "fees_and_costs": float(applied_trade_cost + locals().get('day_costs', 0.0)),
             "comment": str(notes_today),
         }
         if metrics_csv_path:
@@ -2136,7 +2671,14 @@ def deep_learning_backtest(df,
             penalty = 0.005
         brain.record_reward(day_ret - penalty)
     equity = pd.Series(equity, index=px.index, name='Equity')
-    weights_df = pd.DataFrame(w_records, columns=['Date','w_fut','w_tqqq','w_qqq5','L_base','kelly_frac']).set_index('Date')
+    weights_df = pd.DataFrame(
+        w_records,
+        columns=['Date','w_fut','w_tqqq','w_qqq5','L_base','kelly_frac','effective_leverage']
+    ).set_index('Date')
+    weights_df.attrs["timing"] = (
+        "Rows are end-of-day target weights decided after that date's close; "
+        "they are applied to the next trading day's PnL."
+    )
     notes_df = pd.DataFrame(debug_notes, columns=['Date','Notes']).set_index('Date')
     trades_df = pd.DataFrame(trades, columns=['Date','From','To','Fraction','TradeCost']).set_index('Date')
     positions_df = pd.DataFrame(
@@ -2153,7 +2695,11 @@ def deep_learning_backtest(df,
     sharpe = cagr/vol if vol>1e-8 else float('nan')
     calmar = cagr/abs(maxdd) if maxdd<0 else float('nan')
     # TQQQ buy&hold
-    t_ret = px['TQQQ'].pct_change().fillna(0.0) - (tqqq_expense/252.0)
+    t_ret = apply_expense_to_returns(
+        px['TQQQ'].pct_change().fillna(0.0),
+        tqqq_expense,
+        deduct_tqqq_expense_in_returns,
+    )
     t_eq = (1+t_ret).cumprod()
     t_cagr = t_eq.iloc[-1]**(1/years) - 1.0
     t_vol = t_ret.std()*np.sqrt(252.0)
@@ -2167,6 +2713,17 @@ def deep_learning_backtest(df,
         'TQQQ_CAGR': t_cagr, 'TQQQ_Vol': t_vol, 'TQQQ_Sharpe': t_sharpe,
         'TQQQ_MaxDD': t_mdd, 'TQQQ_Calmar': t_calmar, 'TQQQ_Final_Equity': t_eq.iloc[-1]
     }
+    report.update(_price_meta_for_report(
+        px,
+        deduct_tqqq_expense_in_returns=deduct_tqqq_expense_in_returns,
+        deduct_qqq5_expense_in_returns=deduct_qqq5_expense_in_returns,
+    ))
+    report.update(qqq5_policy_report_stats(weights_df, trades_df, qqq5_policy))
+    report.update(effective_leverage_report_stats(
+        weights_df,
+        max_effective_leverage,
+        effective_leverage_cap_hits,
+    ))
     eff_asof, eff_val = compute_effective_leverage_from_weights(weights_df)
     if np.isfinite(eff_val):
         report['Effective_Leverage_Today'] = eff_val
@@ -2194,6 +2751,337 @@ def deep_learning_backtest(df,
         dl_retrain_df = pd.DataFrame(dl_retrain_log, columns=cols).set_index('Date')
     return equity, dd, report, weights_df, trades_df, t_eq, notes_df, positions_df, bandit_diag, dl_retrain_df
 # ------------------ Evaluation helpers ------------------
+def _preserve_price_meta(dst, src):
+    price_meta = getattr(src, "attrs", {}).get("price_meta", None)
+    if price_meta is not None:
+        dst.attrs["price_meta"] = copy.deepcopy(price_meta)
+    return dst
+
+
+def _truncate_common_kw_to_index(common_kw, index, end_ts):
+    out = dict(common_kw or {})
+    for key, val in list(out.items()):
+        if isinstance(val, (pd.Series, pd.DataFrame)):
+            obj = val.sort_index()
+            try:
+                obj = obj.loc[obj.index <= end_ts]
+                obj = obj.reindex(index).ffill().bfill()
+            except Exception:
+                obj = val
+            out[key] = obj
+    return out
+
+
+def _slice_frame_by_dates(frame, start_ts, end_ts):
+    if frame is None:
+        return frame
+    if not isinstance(frame, (pd.Series, pd.DataFrame)) or frame.empty:
+        return frame
+    try:
+        return frame.loc[(frame.index >= start_ts) & (frame.index <= end_ts)].copy()
+    except Exception:
+        return frame
+
+
+def _compute_equity_report(equity, tqqq_eq=None, prefix=""):
+    eq = pd.Series(equity).dropna().astype(float)
+    if eq.empty:
+        return {
+            f"{prefix}CAGR": float("nan"),
+            f"{prefix}Vol": float("nan"),
+            f"{prefix}Sharpe_ex_rf0": float("nan"),
+            f"{prefix}MaxDD": float("nan"),
+            f"{prefix}Calmar": float("nan"),
+            f"{prefix}Final_Equity": float("nan"),
+        }
+    ret_eq = eq.pct_change().fillna(0.0)
+    years = max(len(eq) / 252.0, 1e-12)
+    cagr = eq.iloc[-1]**(1.0 / years) - 1.0 if eq.iloc[-1] > 0 else float("nan")
+    vol = ret_eq.std() * np.sqrt(252.0)
+    dd = (eq / eq.cummax()) - 1.0
+    maxdd = dd.min()
+    sharpe = cagr / vol if vol > 1e-8 else float("nan")
+    calmar = cagr / abs(maxdd) if maxdd < 0 else float("nan")
+    out = {
+        f"{prefix}CAGR": float(cagr),
+        f"{prefix}Vol": float(vol),
+        f"{prefix}Sharpe_ex_rf0": float(sharpe),
+        f"{prefix}MaxDD": float(maxdd),
+        f"{prefix}Calmar": float(calmar),
+        f"{prefix}Final_Equity": float(eq.iloc[-1]),
+    }
+    if tqqq_eq is not None:
+        t_eq = pd.Series(tqqq_eq).dropna().astype(float)
+        if not t_eq.empty:
+            t_ret = t_eq.pct_change().fillna(0.0)
+            t_years = max(len(t_eq) / 252.0, 1e-12)
+            t_cagr = t_eq.iloc[-1]**(1.0 / t_years) - 1.0 if t_eq.iloc[-1] > 0 else float("nan")
+            t_vol = t_ret.std() * np.sqrt(252.0)
+            t_dd = (t_eq / t_eq.cummax()) - 1.0
+            t_mdd = t_dd.min()
+            out.update({
+                f"{prefix}TQQQ_CAGR": float(t_cagr),
+                f"{prefix}TQQQ_Vol": float(t_vol),
+                f"{prefix}TQQQ_Sharpe": float(t_cagr / t_vol) if t_vol > 1e-8 else float("nan"),
+                f"{prefix}TQQQ_MaxDD": float(t_mdd),
+                f"{prefix}TQQQ_Calmar": float(t_cagr / abs(t_mdd)) if t_mdd < 0 else float("nan"),
+                f"{prefix}TQQQ_Final_Equity": float(t_eq.iloc[-1]),
+            })
+    return out
+
+
+def _normalize_oos_series(series):
+    ser = pd.Series(series).dropna().astype(float)
+    if ser.empty:
+        return ser
+    first = float(ser.iloc[0])
+    if not np.isfinite(first) or abs(first) < 1e-12:
+        return ser
+    return ser / first
+
+
+def _tqqq_oos_equity(df_slice, equity_index, common_kw):
+    if "TQQQ" not in df_slice.columns or len(equity_index) == 0:
+        return pd.Series(dtype=float, name="TQQQ_BuyHold")
+    deduct = bool((common_kw or {}).get("deduct_tqqq_expense_in_returns", False))
+    expense = float((common_kw or {}).get("tqqq_expense", 0.009))
+    t_ret = apply_expense_to_returns(
+        df_slice["TQQQ"].pct_change().fillna(0.0),
+        expense,
+        deduct,
+    )
+    t_eq = (1.0 + t_ret).cumprod()
+    t_oos = t_eq.reindex(equity_index).dropna()
+    t_oos = _normalize_oos_series(t_oos)
+    t_oos.name = "TQQQ_BuyHold"
+    return t_oos
+
+
+def run_strict_oos_slice(
+    df,
+    train_start,
+    train_end,
+    test_start,
+    test_end,
+    mode="baseline",
+    policy="bandit",
+    common_kw=None,
+    initial_train_end=None,
+    normalize_oos_equity=True,
+    out_path=None,
+):
+    train_start_ts = pd.Timestamp(train_start)
+    train_end_ts = pd.Timestamp(train_end)
+    test_start_ts = pd.Timestamp(test_start)
+    test_end_ts = pd.Timestamp(test_end)
+    if train_end_ts < train_start_ts:
+        raise ValueError("train_end must be >= train_start.")
+    if test_end_ts < test_start_ts:
+        raise ValueError("test_end must be >= test_start.")
+    if test_start_ts <= train_end_ts:
+        raise ValueError("test_start must be after train_end for strict OOS.")
+
+    mode_norm = (mode or "baseline").lower()
+    if mode_norm not in {"baseline", "dl"}:
+        raise ValueError("mode must be 'baseline' or 'dl'.")
+
+    cutoff_ts = pd.Timestamp(initial_train_end) if initial_train_end is not None else train_end_ts
+    if mode_norm == "dl" and cutoff_ts > train_end_ts:
+        raise ValueError("initial_train_end must be <= train_end in strict DL OOS.")
+
+    df_sorted = df.sort_index()
+    df_slice = df_sorted.loc[(df_sorted.index >= train_start_ts) & (df_sorted.index <= test_end_ts)].copy()
+    _preserve_price_meta(df_slice, df)
+    if df_slice.empty:
+        raise ValueError("strict OOS slice has no rows after train/test truncation.")
+    if df_slice.index.max() > test_end_ts:
+        raise AssertionError("strict OOS helper failed to truncate at test_end.")
+
+    kw = _truncate_common_kw_to_index(common_kw or {}, df_slice.index, test_end_ts)
+    kw["policy_mode"] = policy
+    if mode_norm == "baseline":
+        kw.pop("initial_train_end", None)
+        result = baseline_backtest(df_slice, **kw)
+    else:
+        kw["initial_train_end"] = cutoff_ts
+        result = deep_learning_backtest(df_slice, **kw)
+
+    equity_full, dd_full, report_full = result[0], result[1], dict(result[2])
+    weights_full = result[3] if len(result) > 3 else pd.DataFrame()
+    trades_full = result[4] if len(result) > 4 else pd.DataFrame()
+    notes_full = result[6] if len(result) > 6 else pd.DataFrame()
+
+    equity_oos = equity_full.loc[(equity_full.index >= test_start_ts) & (equity_full.index <= test_end_ts)].copy()
+    if normalize_oos_equity:
+        equity_oos = _normalize_oos_series(equity_oos)
+    equity_oos.name = "Equity"
+    tqqq_oos = _tqqq_oos_equity(df_slice, equity_oos.index, kw)
+
+    weights_oos = _slice_frame_by_dates(weights_full, test_start_ts, test_end_ts)
+    trades_oos = _slice_frame_by_dates(trades_full, test_start_ts, test_end_ts)
+    notes_oos = _slice_frame_by_dates(notes_full, test_start_ts, test_end_ts)
+
+    report_oos = _compute_equity_report(equity_oos, tqqq_oos)
+    report_oos.update({
+        "StrictOOS": True,
+        "Mode": mode_norm,
+        "Policy": policy,
+        "TrainStart": train_start_ts.strftime("%Y-%m-%d"),
+        "TrainEnd": train_end_ts.strftime("%Y-%m-%d"),
+        "TestStart": test_start_ts.strftime("%Y-%m-%d"),
+        "TestEnd": test_end_ts.strftime("%Y-%m-%d"),
+        "InitialTrainEnd": cutoff_ts.strftime("%Y-%m-%d") if mode_norm == "dl" else "",
+        "NormalizeOOSEquity": bool(normalize_oos_equity),
+        "InputEndUsed": df_slice.index.max().strftime("%Y-%m-%d"),
+        "InputRowsUsed": int(len(df_slice)),
+    })
+    for key in [
+        "TQQQ_Expense_Deducted_In_Returns",
+        "QQQ5_Expense_Deducted_In_Returns",
+        "TQQQ_Benchmark_Expense_Deducted",
+        "TQQQ_Price_Expense_Embedded",
+        "QQQ5_Price_Expense_Embedded",
+        "QQQ5_Source",
+        "QQQ5_Disabled",
+        "QQQ5_Allowed",
+        "QQQ5_AllowSynthetic",
+        "QQQ5_HeadlineEligible",
+        "Strict_NoSyntheticQQQ5",
+        "EffectiveLeverageCap",
+        "EffectiveLeverageCapEnabled",
+    ]:
+        if key in report_full:
+            report_oos[key] = report_full[key]
+    if isinstance(weights_oos, pd.DataFrame) and "effective_leverage" in weights_oos.columns:
+        report_oos.update(effective_leverage_report_stats(
+            weights_oos,
+            kw.get("max_effective_leverage"),
+            0,
+        ))
+
+    metadata = {
+        "train_start": train_start_ts.strftime("%Y-%m-%d"),
+        "train_end": train_end_ts.strftime("%Y-%m-%d"),
+        "test_start": test_start_ts.strftime("%Y-%m-%d"),
+        "test_end": test_end_ts.strftime("%Y-%m-%d"),
+        "initial_train_end": cutoff_ts.strftime("%Y-%m-%d") if mode_norm == "dl" else "",
+        "mode": mode_norm,
+        "policy": policy,
+        "input_start_used": df_slice.index.min().strftime("%Y-%m-%d"),
+        "input_end_used": df_slice.index.max().strftime("%Y-%m-%d"),
+        "input_rows_used": int(len(df_slice)),
+        "strict_no_future_after_test_end": bool(df_slice.index.max() <= test_end_ts),
+    }
+    out = {
+        "equity_full": equity_full,
+        "drawdown_full": dd_full,
+        "equity_oos": equity_oos,
+        "weights_oos": weights_oos,
+        "trades_oos": trades_oos,
+        "notes_oos": notes_oos,
+        "report_oos": report_oos,
+        "metadata": metadata,
+    }
+    if out_path:
+        try:
+            pd.DataFrame([{**metadata, **report_oos}]).to_csv(out_path, index=False)
+        except Exception as exc:
+            print(f"[strict_oos] Save failed: {exc}")
+    return out
+
+
+def run_strict_walk_forward(df, slices=None, mode="baseline", policy="bandit", common_kw=None):
+    idx = df.index.sort_values()
+    if len(idx) == 0:
+        return pd.DataFrame()
+    latest = idx.max()
+    if slices is None:
+        slices = [
+            {
+                "label": "2019_2021",
+                "train_start": "2015-01-01",
+                "train_end": "2018-12-31",
+                "test_start": "2019-01-01",
+                "test_end": "2021-12-31",
+            },
+            {
+                "label": "2022_2023",
+                "train_start": "2015-01-01",
+                "train_end": "2021-12-31",
+                "test_start": "2022-01-01",
+                "test_end": "2023-12-31",
+            },
+            {
+                "label": "2024_latest",
+                "train_start": "2015-01-01",
+                "train_end": "2023-12-31",
+                "test_start": "2024-01-01",
+                "test_end": latest,
+            },
+        ]
+    rows = []
+    for n, sl in enumerate(slices):
+        if isinstance(sl, dict):
+            label = sl.get("label", f"slice{n+1}")
+            train_start = sl["train_start"]
+            train_end = sl["train_end"]
+            test_start = sl["test_start"]
+            test_end = sl["test_end"]
+        else:
+            if len(sl) == 5:
+                label, train_start, train_end, test_start, test_end = sl
+            else:
+                train_start, train_end, test_start, test_end = sl
+                label = f"slice{n+1}"
+        try:
+            result = run_strict_oos_slice(
+                df,
+                train_start=train_start,
+                train_end=train_end,
+                test_start=test_start,
+                test_end=test_end,
+                mode=mode,
+                policy=policy,
+                common_kw=common_kw,
+            )
+            report = result["report_oos"]
+            row = {
+                "label": label,
+                "mode": mode,
+                "policy": policy,
+                "train_start": pd.Timestamp(train_start).strftime("%Y-%m-%d"),
+                "train_end": pd.Timestamp(train_end).strftime("%Y-%m-%d"),
+                "test_start": pd.Timestamp(test_start).strftime("%Y-%m-%d"),
+                "test_end": pd.Timestamp(test_end).strftime("%Y-%m-%d"),
+                "CAGR": report.get("CAGR"),
+                "MaxDD": report.get("MaxDD"),
+                "Sharpe_ex_rf0": report.get("Sharpe_ex_rf0"),
+                "Final_Equity": report.get("Final_Equity"),
+                "TQQQ_Final_Equity": report.get("TQQQ_Final_Equity"),
+                "InputEndUsed": report.get("InputEndUsed"),
+                "Error": "",
+            }
+        except Exception as exc:
+            row = {
+                "label": label,
+                "mode": mode,
+                "policy": policy,
+                "train_start": str(train_start),
+                "train_end": str(train_end),
+                "test_start": str(test_start),
+                "test_end": str(test_end),
+                "CAGR": np.nan,
+                "MaxDD": np.nan,
+                "Sharpe_ex_rf0": np.nan,
+                "Final_Equity": np.nan,
+                "TQQQ_Final_Equity": np.nan,
+                "InputEndUsed": "",
+                "Error": str(exc),
+            }
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def run_walk_forward(df, mode, policy, step_months=3, oos_months=6, **kw):
     kw = dict(kw)
     kw.pop("initial_train_end", None)
@@ -2507,12 +3395,26 @@ def main():
     ap.add_argument('--qqq_csv', type=str, default=None)
     ap.add_argument('--tqqq_csv', type=str, default=None)
     ap.add_argument('--qqq5_csv', type=str, default=None)
+    ap.add_argument('--disable_qqq5', action='store_true',
+                    help='Disable all QQQ5 allocation paths for strict headline audits.')
+    ap.add_argument('--allow_synthetic_qqq5', action='store_true',
+                    help='Allow synthetic/hybrid QQQ5 for research only; never headline eligible.')
     ap.add_argument('--kelly_frac', type=float, default=0.493816)
     ap.add_argument('--kelly_lookback_days', type=int, default=252*3)
     ap.add_argument('--rebal_days', type=int, default=3)  # weekly-ish
     ap.add_argument('--fut_fin_spread', type=float, default=0.002)
     ap.add_argument('--tqqq_expense', type=float, default=0.009)
     ap.add_argument('--qqq5_expense', type=float, default=0.0095)
+    ap.add_argument(
+        '--deduct_tqqq_expense_in_returns',
+        action='store_true',
+        help='Explicit stress override: subtract tqqq_expense/252 from TQQQ price returns.',
+    )
+    ap.add_argument(
+        '--deduct_qqq5_expense_in_returns',
+        action='store_true',
+        help='Explicit stress override: subtract qqq5_expense/252 from QQQ5 price returns.',
+    )
     ap.add_argument('--trade_cost_bps', type=float, default=1.0)
     ap.add_argument('--slip_bps', type=float, default=1.0, help='Per-trade slippage bps of traded notional')
     ap.add_argument('--tqqq_slip_bps', type=float, default=1.0, help='Additional slippage when trading TQQQ sleeve')
@@ -2542,6 +3444,8 @@ def main():
                     help='Risk gate clamp for FUT sleeve; excess flows back to cash')
     ap.add_argument('--risk_gate_max_leverage', type=float, default=2.2,
                     help='Risk gate clamp for L_base when shocks persist')
+    ap.add_argument('--max_effective_leverage', type=float, default=None,
+                    help='Optional strict audit cap on next-day target effective leverage, e.g. 3.0')
     ap.add_argument('--kelly_max_step', type=float, default=0.10,
                     help='Maximum per-rebalance change applied to Kelly fraction')
     ap.add_argument('--risk_gate', action='store_true')
@@ -2557,6 +3461,14 @@ def main():
     ap.add_argument('--oos_audit', action='store_true')
     ap.add_argument('--oos_dev_end', type=str, default='2018-12-31')
     ap.add_argument('--oos_val_end', type=str, default='2021-12-31')
+    ap.add_argument('--strict_oos', action='store_true',
+                    help='Run one strict OOS slice without pre-running the full future path.')
+    ap.add_argument('--strict_train_start', type=str, default=None)
+    ap.add_argument('--strict_train_end', type=str, default=None)
+    ap.add_argument('--strict_test_start', type=str, default=None)
+    ap.add_argument('--strict_test_end', type=str, default=None)
+    ap.add_argument('--strict_walk_forward', action='store_true',
+                    help='Run fixed strict walk-forward slices independently.')
     ap.add_argument('--min_years', type=float, default=4.0,
                     help='Minimum data span (in years) required for Kelly estimation')
     ap.add_argument('--out_prefix', type=str, default='qqq_compare')
@@ -2623,7 +3535,11 @@ def main():
         args.end = dt.date.today().isoformat()
     print(f"Backtest window: {args.start} to {args.end}")
     df, synth5 = load_prices(args)
+    price_meta_for_run = getattr(df, "attrs", {}).get("price_meta", None)
     df = df.loc[(df.index>=args.start) & (df.index<=args.end)]
+    if price_meta_for_run is not None:
+        df.attrs["price_meta"] = price_meta_for_run
+    qqq5_source_for_run = _qqq5_source_from_df(df)
     if len(df) < int(252 * args.min_years):
         raise SystemExit(f"Need >= ~{args.min_years:.1f} years of data for rolling Kelly.")
     # rf series (or constant override)
@@ -2668,6 +3584,71 @@ def main():
             return None
     adv_tqqq = _load_adv_csv(args.adv_tqqq_csv)
     adv_qqq5 = _load_adv_csv(args.adv_qqq5_csv)
+    strict_common_kw = dict(
+        rf_series=rf_series, rf_ann=rf_ann, base_kelly_frac=args.kelly_frac,
+        kelly_lookback_days=args.kelly_lookback_days, rebalance_every_days=args.rebal_days,
+        fut_fin_spread=args.fut_fin_spread, tqqq_expense=args.tqqq_expense, qqq5_expense=args.qqq5_expense,
+        deduct_tqqq_expense_in_returns=args.deduct_tqqq_expense_in_returns,
+        deduct_qqq5_expense_in_returns=args.deduct_qqq5_expense_in_returns,
+        trade_cost_bps=args.trade_cost_bps, bandit_alpha=args.bandit_alpha, use_risk_gate=args.risk_gate,
+        vix_series=vix_series, target_vol=args.target_vol, dl_conf=args.dl_conf,
+        dl_max_daily_qqq5=args.dl_max_daily_qqq5, dl_delever_threshold=args.dl_delever_threshold,
+        dl_delever_frac=args.dl_delever_frac, dl_max_qqq5=args.dl_max_qqq5, dl_max_tqqq=args.dl_max_tqqq,
+        dl_trade_max_frac=args.dl_trade_max_frac, dl_cooldown=args.dl_cooldown,
+        adv_series=adv_series, slip_bps=args.slip_bps, impact_k=args.impact_k,
+        risk_gate_max_fut_frac=args.risk_gate_max_fut_frac,
+        risk_gate_max_leverage=args.risk_gate_max_leverage,
+        max_effective_leverage=args.max_effective_leverage,
+        kelly_max_step=args.kelly_max_step,
+        tqqq_slip_bps=args.tqqq_slip_bps,
+        qqq5_slip_bps=args.qqq5_slip_bps,
+        adv_series_tqqq=adv_tqqq,
+        adv_series_qqq5=adv_qqq5,
+        adv_daily_frac_cap=args.adv_daily_frac_cap,
+        metrics_csv_path=None,
+        crash_mode=args.crash_mode,
+        crash_tail_frac=args.crash_tail_frac,
+        disable_qqq5=args.disable_qqq5,
+        allow_synthetic_qqq5=args.allow_synthetic_qqq5,
+        qqq5_source=qqq5_source_for_run
+    )
+    if args.strict_oos or args.strict_walk_forward:
+        strict_mode = 'baseline' if args.mode == 'baseline' else 'dl'
+        if args.strict_oos:
+            train_start = args.strict_train_start or args.start
+            train_end = args.strict_train_end or args.initial_train_end
+            test_start = args.strict_test_start or (pd.Timestamp(train_end) + pd.offsets.BDay(1)).strftime("%Y-%m-%d")
+            test_end = args.strict_test_end or args.end
+            strict_result = run_strict_oos_slice(
+                df,
+                train_start=train_start,
+                train_end=train_end,
+                test_start=test_start,
+                test_end=test_end,
+                mode=strict_mode,
+                policy=args.policy,
+                common_kw=strict_common_kw,
+                initial_train_end=train_end if strict_mode == 'dl' else None,
+                out_path=f"{args.out_prefix}_strict_oos.csv",
+            )
+            strict_result["equity_oos"].to_csv(f"{args.out_prefix}_strict_oos_equity.csv")
+            strict_result["weights_oos"].to_csv(f"{args.out_prefix}_strict_oos_weights.csv")
+            strict_result["trades_oos"].to_csv(f"{args.out_prefix}_strict_oos_trades.csv")
+            print(f"[strict_oos] Saved: {args.out_prefix}_strict_oos.csv")
+            print(f"[strict_oos] Saved: {args.out_prefix}_strict_oos_equity.csv")
+            print(f"[strict_oos] Saved: {args.out_prefix}_strict_oos_weights.csv")
+            print(f"[strict_oos] Saved: {args.out_prefix}_strict_oos_trades.csv")
+        if args.strict_walk_forward:
+            strict_wf = run_strict_walk_forward(
+                df,
+                mode=strict_mode,
+                policy=args.policy,
+                common_kw=strict_common_kw,
+            )
+            strict_wf_path = f"{args.out_prefix}_strict_walk_forward.csv"
+            strict_wf.to_csv(strict_wf_path, index=False)
+            print(f"[strict_walk_forward] Saved: {strict_wf_path}")
+        return
     results = {}
     if args.mode in ('baseline','both'):
         print("Running BASELINE+POLICY strategy...")
@@ -2681,6 +3662,8 @@ def main():
             fut_fin_spread=args.fut_fin_spread,
             tqqq_expense=args.tqqq_expense,
             qqq5_expense=args.qqq5_expense,
+            deduct_tqqq_expense_in_returns=args.deduct_tqqq_expense_in_returns,
+            deduct_qqq5_expense_in_returns=args.deduct_qqq5_expense_in_returns,
             trade_cost_bps=args.trade_cost_bps,
             policy_mode=args.policy,
             bandit_alpha=args.bandit_alpha,
@@ -2702,7 +3685,11 @@ def main():
             adv_daily_frac_cap=args.adv_daily_frac_cap,
             metrics_csv_path=args.metrics_csv,
             crash_mode=args.crash_mode,
-            crash_tail_frac=args.crash_tail_frac
+            crash_tail_frac=args.crash_tail_frac,
+            max_effective_leverage=args.max_effective_leverage,
+            disable_qqq5=args.disable_qqq5,
+            allow_synthetic_qqq5=args.allow_synthetic_qqq5,
+            qqq5_source=qqq5_source_for_run
         )
         results['baseline'] = (beq, bdd, brep, bwt, btr, btq, bnotes, bpos, bbandit, None)
     if args.mode in ('dl','both'):
@@ -2717,6 +3704,8 @@ def main():
             fut_fin_spread=args.fut_fin_spread,
             tqqq_expense=args.tqqq_expense,
             qqq5_expense=args.qqq5_expense,
+            deduct_tqqq_expense_in_returns=args.deduct_tqqq_expense_in_returns,
+            deduct_qqq5_expense_in_returns=args.deduct_qqq5_expense_in_returns,
             trade_cost_bps=args.trade_cost_bps,
             policy_mode=args.policy,
             bandit_alpha=args.bandit_alpha,
@@ -2739,7 +3728,11 @@ def main():
             initial_train_end=args.initial_train_end,
             metrics_csv_path=args.metrics_csv,
             crash_mode=args.crash_mode,
-            crash_tail_frac=args.crash_tail_frac
+            crash_tail_frac=args.crash_tail_frac,
+            max_effective_leverage=args.max_effective_leverage,
+            disable_qqq5=args.disable_qqq5,
+            allow_synthetic_qqq5=args.allow_synthetic_qqq5,
+            qqq5_source=qqq5_source_for_run
         )
         results['dl'] = (deq, ddd, drep, dwt, dtr, dtq, dnotes, dpos, dbandit, dlretrain)
     # Simple MA crossover (TQQQ only)
@@ -2749,6 +3742,9 @@ def main():
         fast=5,
         slow=20,
         tqqq_expense=args.tqqq_expense,
+        qqq5_expense=args.qqq5_expense,
+        deduct_tqqq_expense_in_returns=args.deduct_tqqq_expense_in_returns,
+        deduct_qqq5_expense_in_returns=args.deduct_qqq5_expense_in_returns,
         trade_cost_bps=args.trade_cost_bps,
         slip_bps=args.slip_bps
     )
@@ -2775,17 +3771,31 @@ def main():
             dl_retrain_df.to_csv(dr_path)
             print(f"[{name}] Saved DL retrain log: {dr_path}")
     print("\n==== REPORT ====")
+    print(
+        "Expense policy: TQQQ benchmark uses price returns; no additional fund "
+        "expense deducted unless explicitly requested."
+    )
+    print(
+        "Expense flags: "
+        f"deduct_tqqq_expense_in_returns={bool(args.deduct_tqqq_expense_in_returns)}, "
+        f"deduct_qqq5_expense_in_returns={bool(args.deduct_qqq5_expense_in_returns)}"
+    )
+    print(f"Effective leverage cap: {args.max_effective_leverage if args.max_effective_leverage else 'disabled'}")
     for name, pack in results.items():
         rep = pack[2]
         print(f"\n--- {name.upper()} ---")
         for k,v in rep.items():
             print(f"{k}: {v:.4f}" if isinstance(v,(int,float)) else f"{k}: {v}")
+        if (not bool(rep.get("QQQ5_HeadlineEligible", False))) and float(rep.get("QQQ5_MaxWeight", 0.0) or 0.0) > 1e-12:
+            print("QQQ5 is research-only and not headline-eligible.")
     if synth5:
         print("Note: QQQ5 synthesized (with airbag) + hybrid with live series when available.")
     common_kw = dict(
         rf_series=rf_series, rf_ann=rf_ann, base_kelly_frac=args.kelly_frac,
         kelly_lookback_days=args.kelly_lookback_days, rebalance_every_days=args.rebal_days,
         fut_fin_spread=args.fut_fin_spread, tqqq_expense=args.tqqq_expense, qqq5_expense=args.qqq5_expense,
+        deduct_tqqq_expense_in_returns=args.deduct_tqqq_expense_in_returns,
+        deduct_qqq5_expense_in_returns=args.deduct_qqq5_expense_in_returns,
         trade_cost_bps=args.trade_cost_bps, bandit_alpha=args.bandit_alpha, use_risk_gate=args.risk_gate,
         vix_series=vix_series, target_vol=args.target_vol, dl_conf=args.dl_conf,
         dl_max_daily_qqq5=args.dl_max_daily_qqq5, dl_delever_threshold=args.dl_delever_threshold,
@@ -2794,6 +3804,7 @@ def main():
         adv_series=adv_series, slip_bps=args.slip_bps, impact_k=args.impact_k,
         risk_gate_max_fut_frac=args.risk_gate_max_fut_frac,
         risk_gate_max_leverage=args.risk_gate_max_leverage,
+        max_effective_leverage=args.max_effective_leverage,
         kelly_max_step=args.kelly_max_step,
         tqqq_slip_bps=args.tqqq_slip_bps,
         qqq5_slip_bps=args.qqq5_slip_bps,
@@ -2802,7 +3813,10 @@ def main():
         adv_daily_frac_cap=args.adv_daily_frac_cap,
         metrics_csv_path=None,
         crash_mode=args.crash_mode,
-        crash_tail_frac=args.crash_tail_frac
+        crash_tail_frac=args.crash_tail_frac,
+        disable_qqq5=args.disable_qqq5,
+        allow_synthetic_qqq5=args.allow_synthetic_qqq5,
+        qqq5_source=qqq5_source_for_run
     )
     if args.oos_audit:
         audit_mode = 'baseline' if args.mode == 'baseline' else 'dl'

@@ -32,8 +32,10 @@ def test_committee_voltarget_weights_high_dsr_prefers_low_vol():
         {"w_fut": 0.90, "w_tqqq": 0.10, "w_qqq5": 0.00, "Vol": 0.20},
     ]
     weights = compute_committee_weights(rows, mode="voltarget")
-    # Lower vol row should get higher weight.
-    assert weights[0] < weights[1]
+    # compute_committee_weights returns fused sleeve weights, not member weights.
+    # Inverse-vol row weights are 1/3 and 2/3, so the fused sleeve should tilt
+    # toward the lower-vol second row: [0.80, 0.20, 0.00].
+    assert np.allclose(weights, np.array([0.80, 0.20, 0.00]))
     assert abs(np.sum(weights) - 1.0) < 1e-12
 
 
@@ -65,7 +67,7 @@ def test_append_jsonl_and_debounce(tmp_path: Path):
 
 
 def test_is_in_close_window_smoke():
-    now_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+    now_utc = pd.Timestamp.now(tz="UTC")
     allowed, detail = is_in_close_window(now_utc)
     assert isinstance(allowed, bool)
     assert isinstance(detail, str)
