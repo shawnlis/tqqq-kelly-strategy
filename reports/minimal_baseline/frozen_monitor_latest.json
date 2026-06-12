@@ -1,0 +1,25 @@
+{
+  "asof_date": "2026-06-11",
+  "days_since_last_switch": 45,
+  "decision_status": "HOLD",
+  "distance_to_ma_pct": 0.1336698172760451,
+  "last_switch_date": "2026-04-08",
+  "latest_close": 717.1199951171875,
+  "ma150": 632.5651298014322,
+  "ma_window": 150,
+  "notes": [
+    "Monitoring only; not a trade instruction.",
+    "Day t close signal applies to the next trading session.",
+    "Frozen rule: QQQ close > QQQ MA150 means risk-on TQQQ; otherwise risk-off QQQ.",
+    "Decision remains HOLD and paper-trading status remains NOT_READY.",
+    "No broker connection, account read, order generation, or automatic execution is performed."
+  ],
+  "paper_trading_status": "NOT_READY",
+  "previous_signal_state": "risk_on",
+  "risk_off_asset": "QQQ",
+  "risk_on_asset": "TQQQ",
+  "rule_name": "Frozen MA150 risk-off QQQ",
+  "signal_changed": false,
+  "signal_state": "risk_on",
+  "target_asset_next_session": "TQQQ"
+}

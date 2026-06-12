@@ -9,6 +9,7 @@ that are shifted one bar before they affect returns.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from pathlib import Path
 from typing import Iterable
@@ -2290,6 +2291,203 @@ def write_operational_feasibility_outputs(results: pd.DataFrame, out_prefix: str
     return csv_path, report_path
 
 
+def _monitor_signal_state(close: float, ma_value: float) -> str:
+    if not np.isfinite(float(ma_value)):
+        return "risk_off"
+    return "risk_on" if float(close) > float(ma_value) else "risk_off"
+
+
+def generate_frozen_ma150_monitor(
+    df: pd.DataFrame,
+    asof_date=None,
+    risk_on_asset: str = "TQQQ",
+    risk_off_asset: str = "QQQ",
+    ma_window: int = 150,
+) -> dict:
+    """Generate a monitoring-only frozen MA150 signal report.
+
+    The as-of close signal is a target for the next trading session. This
+    function does not place orders, read accounts, or generate executable
+    instructions.
+    """
+    px = _require_price_frame(df)
+    if int(ma_window) != 150:
+        raise ValueError("frozen monitor is locked to ma_window=150.")
+    if str(risk_on_asset).upper() != "TQQQ" or str(risk_off_asset).upper() != "QQQ":
+        raise ValueError("frozen monitor is locked to risk-on TQQQ and risk-off QQQ.")
+
+    if asof_date is not None:
+        cutoff = px.loc[px.index <= pd.Timestamp(asof_date)].copy()
+    else:
+        cutoff = px.copy()
+    if cutoff.empty:
+        raise ValueError("no price rows are available at or before asof_date.")
+
+    qqq = cutoff["QQQ"].astype(float)
+    ma = qqq.rolling(int(ma_window)).mean()
+    asof_ts = pd.Timestamp(cutoff.index[-1])
+    latest_close = float(qqq.iloc[-1])
+    latest_ma = float(ma.iloc[-1]) if pd.notna(ma.iloc[-1]) else float("nan")
+    distance = (latest_close / latest_ma - 1.0) if np.isfinite(latest_ma) and abs(latest_ma) > 1e-12 else float("nan")
+
+    signal_state = _monitor_signal_state(latest_close, latest_ma)
+    previous_signal_state = "unknown"
+    signal_changed = False
+    if len(cutoff) >= 2:
+        previous_signal_state = _monitor_signal_state(float(qqq.iloc[-2]), float(ma.iloc[-2]) if pd.notna(ma.iloc[-2]) else float("nan"))
+        signal_changed = signal_state != previous_signal_state
+
+    state_series = pd.Series(
+        [_monitor_signal_state(float(c), float(m) if pd.notna(m) else float("nan")) for c, m in zip(qqq, ma)],
+        index=cutoff.index,
+        dtype=object,
+    )
+    switch_mask = state_series.ne(state_series.shift())
+    if len(switch_mask) > 0:
+        switch_mask.iloc[0] = False
+    switch_dates = state_series.index[switch_mask.fillna(False)]
+    if len(switch_dates) > 0:
+        last_switch_ts = pd.Timestamp(switch_dates[-1])
+        days_since_last_switch = int(cutoff.index.get_loc(asof_ts) - cutoff.index.get_loc(last_switch_ts))
+        last_switch_date = last_switch_ts.strftime("%Y-%m-%d")
+    else:
+        last_switch_date = None
+        days_since_last_switch = None
+
+    target_asset = str(risk_on_asset).upper() if signal_state == "risk_on" else str(risk_off_asset).upper()
+    notes = [
+        "Monitoring only; not a trade instruction.",
+        "Day t close signal applies to the next trading session.",
+        "Frozen rule: QQQ close > QQQ MA150 means risk-on TQQQ; otherwise risk-off QQQ.",
+        "Decision remains HOLD and paper-trading status remains NOT_READY.",
+        "No broker connection, account read, order generation, or automatic execution is performed.",
+    ]
+    return {
+        "asof_date": asof_ts.strftime("%Y-%m-%d"),
+        "latest_close": latest_close,
+        "ma150": latest_ma,
+        "distance_to_ma_pct": distance,
+        "signal_state": signal_state,
+        "target_asset_next_session": target_asset,
+        "previous_signal_state": previous_signal_state,
+        "signal_changed": bool(signal_changed),
+        "last_switch_date": last_switch_date,
+        "days_since_last_switch": days_since_last_switch,
+        "rule_name": "Frozen MA150 risk-off QQQ",
+        "risk_on_asset": str(risk_on_asset).upper(),
+        "risk_off_asset": str(risk_off_asset).upper(),
+        "ma_window": int(ma_window),
+        "decision_status": "HOLD",
+        "paper_trading_status": "NOT_READY",
+        "notes": notes,
+    }
+
+
+def build_frozen_monitor_spec() -> str:
+    lines = [
+        "# Frozen MA150 Forward Monitor Specification",
+        "",
+        "## Frozen Rule",
+        "",
+        "- MA150 rule is frozen.",
+        "- Risk-on asset: TQQQ.",
+        "- Risk-off asset: QQQ.",
+        "- Signal is based on QQQ close versus QQQ MA150.",
+        "- Signal at day t close applies to the next trading session.",
+        "- The monitor is not paper-trading ready and does not authorize allocation.",
+        "",
+        "## Safety Boundary",
+        "",
+        "- No broker connection.",
+        "- No account read.",
+        "- No order generation.",
+        "- No automatic execution.",
+        "- No trade recommendation.",
+        "- Output is monitoring-only and must not be treated as an instruction to trade.",
+        "",
+        "## Manual Checklist Before Any Future Paper Trading",
+        "",
+        "1. Confirm no-lookahead daily timing remains covered by tests.",
+        "2. Confirm strict OOS and raw TQQQ benchmark assumptions remain unchanged.",
+        "3. Confirm cost, turnover, and operational feasibility hurdles remain acceptable.",
+        "4. Confirm daily artifacts are retained for every monitor run used in research review.",
+        "5. Confirm the rule remains frozen; do not tune MA windows from monitor outcomes.",
+        "6. Confirm paper-trading entry hurdles in GO_NO_GO_HURDLES.md are met.",
+        "",
+        "## Conditions Before Paper Trading Is Reconsidered",
+        "",
+        "- Current status must move from HOLD to an explicitly documented approval state.",
+        "- The strategy must pass the frozen go/no-go hurdles without parameter changes.",
+        "- Slippage/cost, underwater/pain, and operational-burden evidence must remain acceptable.",
+        "- A separate paper-trading plan must define capital cap, kill switch, logs, and manual operator controls.",
+        "- This monitor alone is insufficient evidence for paper trading.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _json_safe_value(value):
+    if isinstance(value, dict):
+        return {str(k): _json_safe_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe_value(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe_value(v) for v in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        val = float(value)
+        return val if np.isfinite(val) else None
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    return value
+
+
+def build_frozen_monitor_report(monitor: dict) -> str:
+    lines = [
+        "# Frozen MA150 Monitor",
+        "",
+        "Monitoring only, not trade instruction.",
+        "",
+        "## Current Signal",
+        "",
+        f"- As-of date: {monitor['asof_date']}",
+        f"- QQQ close: {_fmt_num(monitor['latest_close'])}",
+        f"- QQQ MA150: {_fmt_num(monitor['ma150'])}",
+        f"- Distance to MA: {_fmt_pct(monitor['distance_to_ma_pct'])}",
+        f"- Current signal: {monitor['signal_state']}",
+        f"- Next-session target: {monitor['target_asset_next_session']}",
+        f"- Signal changed?: {monitor['signal_changed']}",
+        f"- Last switch date: {monitor['last_switch_date'] or 'n/a'}",
+        f"- Trading sessions since switch: {monitor['days_since_last_switch'] if monitor['days_since_last_switch'] is not None else 'n/a'}",
+        f"- Status: {monitor['decision_status']} / {str(monitor['paper_trading_status']).replace('_', ' ')} FOR PAPER TRADING",
+        "",
+        "## Manual Review Checklist",
+        "",
+        "- Confirm this run used only prices available at or before the as-of date.",
+        "- Confirm no broker, account, or order system was connected.",
+        "- Confirm this monitor output is not being used as an order ticket.",
+        "- Confirm MA150 remains frozen and no parameter was changed.",
+        "- Confirm the HOLD / NOT READY status remains in force.",
+        "- Confirm any future paper-trading consideration is handled in a separate approval document.",
+        "",
+        "## Notes",
+        "",
+        *[f"- {note}" for note in monitor.get("notes", [])],
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def write_frozen_monitor_outputs(monitor: dict, monitor_out: str | Path) -> tuple[Path, Path, Path]:
+    report_path = Path(monitor_out)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    spec_path = report_path.parent / "FROZEN_MONITOR_SPEC.md"
+    json_path = report_path.with_suffix(".json")
+    spec_path.write_text(build_frozen_monitor_spec(), encoding="utf-8")
+    report_path.write_text(build_frozen_monitor_report(monitor), encoding="utf-8")
+    json_path.write_text(json.dumps(_json_safe_value(monitor), indent=2, sort_keys=True), encoding="utf-8")
+    return spec_path, report_path, json_path
+
+
 def write_outputs(summary: pd.DataFrame, out_prefix: str) -> tuple[Path, Path]:
     prefix = Path(out_prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -2316,6 +2514,9 @@ def parse_args(argv=None):
     ap.add_argument("--cost_bps_list", default="0,5,10,25,50")
     ap.add_argument("--execution_delay_days", type=int, default=0)
     ap.add_argument("--operational_feasibility_audit", action="store_true")
+    ap.add_argument("--frozen_monitor", action="store_true")
+    ap.add_argument("--monitor_asof", default=None)
+    ap.add_argument("--monitor_out", default="reports/minimal_baseline/frozen_monitor_latest.md")
     return ap.parse_args(argv)
 
 
@@ -2325,6 +2526,24 @@ def main(argv=None) -> int:
     if end is None or str(end).lower() == "auto":
         end = (pd.Timestamp.today().normalize() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     df = load_price_data(args.start, end, qqq_csv=args.qqq_csv, tqqq_csv=args.tqqq_csv)
+    monitor_only = args.frozen_monitor and not any(
+        [
+            args.ma_behavior_audit,
+            args.underwater_pain_audit,
+            args.save_daily_artifacts,
+            args.cost_stress_audit,
+            args.operational_feasibility_audit,
+        ]
+    )
+    if monitor_only:
+        monitor = generate_frozen_ma150_monitor(df, asof_date=args.monitor_asof)
+        spec_path, monitor_path, json_path = write_frozen_monitor_outputs(monitor, args.monitor_out)
+        print(f"[minimal] wrote {spec_path}")
+        print(f"[minimal] wrote {monitor_path}")
+        print(f"[minimal] wrote {json_path}")
+        print(f"[minimal] frozen monitor target next session: {monitor['target_asset_next_session']}")
+        return 0
+
     slices = _load_slices_from_csv(args.slices_csv, df)
     summary = run_minimal_baseline_suite(df, slices)
     csv_path, report_path = write_outputs(summary, args.out_prefix)
@@ -2366,6 +2585,13 @@ def main(argv=None) -> int:
         )
         print(f"[minimal] wrote {operational_csv}")
         print(f"[minimal] wrote {operational_report}")
+    if args.frozen_monitor:
+        monitor = generate_frozen_ma150_monitor(df, asof_date=args.monitor_asof)
+        spec_path, monitor_path, json_path = write_frozen_monitor_outputs(monitor, args.monitor_out)
+        print(f"[minimal] wrote {spec_path}")
+        print(f"[minimal] wrote {monitor_path}")
+        print(f"[minimal] wrote {json_path}")
+        print(f"[minimal] frozen monitor target next session: {monitor['target_asset_next_session']}")
     return 0
 
 
