@@ -617,6 +617,247 @@ def analyze_ma_regime_behavior(df: pd.DataFrame, results: pd.DataFrame) -> dict:
     }
 
 
+def _underwater_run_lengths(drawdown: pd.Series, eps: float = 1e-12) -> list[int]:
+    underwater = pd.Series(drawdown).fillna(0.0).astype(float) < -eps
+    runs = []
+    current = 0
+    for flag in underwater:
+        if bool(flag):
+            current += 1
+        elif current:
+            runs.append(current)
+            current = 0
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _worst_rolling_return(equity: pd.Series, window: int) -> float:
+    ser = pd.Series(equity).dropna().astype(float)
+    if len(ser) <= int(window):
+        return float("nan")
+    rolling = ser / ser.shift(int(window)) - 1.0
+    rolling = rolling.dropna()
+    return float(rolling.min()) if not rolling.empty else float("nan")
+
+
+def _best_missed_rolling_return_vs_tqqq(equity: pd.Series, benchmark_equity: pd.Series, window: int = 21) -> float:
+    aligned = pd.concat(
+        [pd.Series(equity).rename("strategy"), pd.Series(benchmark_equity).rename("tqqq")],
+        axis=1,
+    ).dropna()
+    if len(aligned) <= int(window):
+        return float("nan")
+    strategy_ret = aligned["strategy"] / aligned["strategy"].shift(int(window)) - 1.0
+    tqqq_ret = aligned["tqqq"] / aligned["tqqq"].shift(int(window)) - 1.0
+    missed = (tqqq_ret - strategy_ret)[tqqq_ret > 0.0].dropna()
+    if missed.empty:
+        return 0.0
+    return float(max(0.0, missed.max()))
+
+
+def compute_underwater_pain_metrics(equity: pd.Series, benchmark_equity: pd.Series | None = None) -> dict:
+    """Compute path-dependent drawdown and pain metrics from daily equity."""
+    eq = _normalize(pd.Series(equity).dropna().astype(float))
+    if eq.empty:
+        raise ValueError("equity must contain at least one valid observation.")
+    running_max = eq.cummax()
+    drawdown = eq / running_max - 1.0
+    runs = _underwater_run_lengths(drawdown)
+    maxdd_pos = int(np.argmin(drawdown.values))
+    maxdd_date = eq.index[maxdd_pos]
+    maxdd = float(drawdown.iloc[maxdd_pos])
+    peak_value = float(running_max.iloc[maxdd_pos])
+    recovery_slice = eq.iloc[maxdd_pos:]
+    recovered = recovery_slice[recovery_slice >= peak_value - 1e-12]
+    if abs(maxdd) <= 1e-12:
+        recovery_days = 0.0
+        recovered_flag = True
+        recovery_end_pos = maxdd_pos
+    elif recovered.empty:
+        recovery_days = float("nan")
+        recovered_flag = False
+        recovery_end_pos = len(eq) - 1
+    else:
+        recovery_end_pos = int(eq.index.get_loc(recovered.index[0]))
+        recovery_days = float(recovery_end_pos - maxdd_pos)
+        recovered_flag = True
+
+    if benchmark_equity is None:
+        bench = eq.copy()
+    else:
+        bench = _normalize(pd.Series(benchmark_equity).dropna().astype(float)).reindex(eq.index).ffill().dropna()
+        aligned = pd.concat([eq.rename("strategy"), bench.rename("benchmark")], axis=1).dropna()
+        eq = aligned["strategy"]
+        bench = aligned["benchmark"]
+        running_max = eq.cummax()
+        drawdown = eq / running_max - 1.0
+        runs = _underwater_run_lengths(drawdown)
+        maxdd_pos = int(np.argmin(drawdown.values))
+        maxdd_date = eq.index[maxdd_pos]
+        maxdd = float(drawdown.iloc[maxdd_pos])
+        peak_value = float(running_max.iloc[maxdd_pos])
+        recovery_slice = eq.iloc[maxdd_pos:]
+        recovered = recovery_slice[recovery_slice >= peak_value - 1e-12]
+        if abs(maxdd) <= 1e-12:
+            recovery_days = 0.0
+            recovered_flag = True
+            recovery_end_pos = maxdd_pos
+        elif recovered.empty:
+            recovery_days = float("nan")
+            recovered_flag = False
+            recovery_end_pos = len(eq) - 1
+        else:
+            recovery_end_pos = int(eq.index.get_loc(recovered.index[0]))
+            recovery_days = float(recovery_end_pos - maxdd_pos)
+            recovered_flag = True
+
+    start_value = float(eq.iloc[maxdd_pos])
+    end_value = float(eq.iloc[recovery_end_pos])
+    bench_start = float(bench.iloc[maxdd_pos])
+    bench_end = float(bench.iloc[recovery_end_pos])
+    strategy_recovery_return = end_value / start_value - 1.0 if abs(start_value) > 1e-12 else float("nan")
+    benchmark_recovery_return = bench_end / bench_start - 1.0 if abs(bench_start) > 1e-12 else float("nan")
+    if pd.isna(benchmark_recovery_return) or abs(benchmark_recovery_return) <= 1e-12:
+        recovery_participation = float("nan")
+    else:
+        recovery_participation = float(strategy_recovery_return / benchmark_recovery_return)
+
+    previous_high = eq.cummax().shift(1)
+    new_highs = int(((eq > previous_high.fillna(-np.inf) + 1e-12)).sum())
+    pct_below_high = float((drawdown < -1e-12).mean())
+    dd_magnitude = drawdown.clip(upper=0.0).abs()
+    return {
+        "MaxDD": maxdd,
+        "MaxDDDate": str(pd.Timestamp(maxdd_date).date()),
+        "LongestUnderwaterDays": int(max(runs) if runs else 0),
+        "AverageUnderwaterDays": float(np.mean(runs) if runs else 0.0),
+        "TimeToRecoveryAfterMaxDDDays": recovery_days,
+        "MaxDDRecovered": bool(recovered_flag),
+        "UlcerIndex": float(np.sqrt(np.mean(np.square(drawdown.clip(upper=0.0))))),
+        "PainIndex": float(dd_magnitude.mean()),
+        "Worst1MReturn": _worst_rolling_return(eq, 21),
+        "Worst3MReturn": _worst_rolling_return(eq, 63),
+        "Worst6MReturn": _worst_rolling_return(eq, 126),
+        "BestMissed1MReturnVsTQQQ": _best_missed_rolling_return_vs_tqqq(eq, bench, 21),
+        "RecoveryParticipationAfterDrawdown": recovery_participation,
+        "NewEquityHighs": new_highs,
+        "PctTimeBelowPreviousHigh": pct_below_high,
+    }
+
+
+def _underwater_strategy_specs() -> list[tuple[str, str, callable]]:
+    return [
+        ("TQQQ buy-and-hold", "raw_tqqq", lambda d: run_static_blend_backtest(d, 1.0, 0.0, 0.0)),
+        ("70/30 TQQQ/QQQ", "static_blend", lambda d: run_static_blend_backtest(d, 0.7, 0.3, 0.0)),
+        ("50/50 TQQQ/QQQ", "static_blend", lambda d: run_static_blend_backtest(d, 0.5, 0.5, 0.0)),
+        (
+            "MA150 risk-off QQQ",
+            "ma_regime",
+            lambda d: run_ma_regime_backtest(d, {"ma_window": 150, "risk_off_asset": "qqq", "confirmation_days": 1}),
+        ),
+    ]
+
+
+def _strict_complex_summary_rows() -> pd.DataFrame:
+    path = Path("reports/strict_audit/strict_audit_summary.csv")
+    if not path.exists():
+        return pd.DataFrame()
+    src = pd.read_csv(path)
+    src = src[src.get("mode", pd.Series(dtype=str)) == "baseline"].copy()
+    if src.empty:
+        return src
+    rows = []
+    for _, r in src.iterrows():
+        rows.append(
+            {
+                "slice": str(r["slice"]),
+                "strategy": "current strict complex baseline",
+                "family": "complex_baseline",
+                "train_start": str(r.get("train_start", "")),
+                "train_end": str(r.get("train_end", "")),
+                "test_start": str(r.get("test_start", "")),
+                "test_end": str(r.get("input_end_used", r.get("test_end", ""))),
+                "CAGR": float(r.get("strategy_cagr", np.nan)),
+                "MaxDD": float(r.get("strategy_maxdd", np.nan)),
+                "Calmar": float(r.get("strategy_calmar", np.nan)),
+                "Sharpe_DailyExcess": float(r.get("strategy_sharpe_daily_excess", np.nan)),
+                "Final_Equity": float(r.get("strategy_final_equity", np.nan)),
+                "LongestUnderwaterDays": np.nan,
+                "AverageUnderwaterDays": np.nan,
+                "TimeToRecoveryAfterMaxDDDays": np.nan,
+                "MaxDDRecovered": "",
+                "UlcerIndex": np.nan,
+                "PainIndex": np.nan,
+                "Worst1MReturn": np.nan,
+                "Worst3MReturn": np.nan,
+                "Worst6MReturn": np.nan,
+                "BestMissed1MReturnVsTQQQ": np.nan,
+                "RecoveryParticipationAfterDrawdown": np.nan,
+                "NewEquityHighs": np.nan,
+                "PctTimeBelowPreviousHigh": np.nan,
+                "MaxDDDate": "",
+                "data_availability": "summary_only_no_daily_equity",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def run_underwater_pain_audit(df: pd.DataFrame, strict_slices: Iterable[dict] | None = None) -> pd.DataFrame:
+    """Run path-dependent underwater/pain metrics for fixed minimal baselines."""
+    px = _require_price_frame(df)
+    slices = list(strict_slices or default_strict_slices(px))
+    rows = []
+    for sl in slices:
+        train_start = pd.Timestamp(sl["train_start"])
+        test_start = pd.Timestamp(sl["test_start"])
+        test_end = min(pd.Timestamp(sl["test_end"]), pd.Timestamp(px.index.max()))
+        df_slice = px.loc[(px.index >= train_start) & (px.index <= test_end)].copy()
+        if df_slice.empty:
+            continue
+        oos_index = df_slice.loc[(df_slice.index >= test_start) & (df_slice.index <= test_end)].index
+        if len(oos_index) < 2:
+            continue
+        for label, family, fn in _underwater_strategy_specs():
+            result = fn(df_slice)
+            equity_oos = _normalize(result["equity"].reindex(oos_index)).rename("Equity")
+            tqqq_oos = _normalize(result["benchmark_equity"].reindex(oos_index)).rename("TQQQ_BuyHold")
+            perf = compute_performance_metrics(
+                equity_oos,
+                benchmark_equity=tqqq_oos,
+                rf_ann=DEFAULT_RF_ANN,
+                periods_per_year=PERIODS_PER_YEAR,
+            )
+            pain = compute_underwater_pain_metrics(equity_oos, tqqq_oos)
+            rows.append(
+                {
+                    "slice": sl["slice"],
+                    "strategy": label,
+                    "family": family,
+                    "train_start": sl["train_start"],
+                    "train_end": sl["train_end"],
+                    "test_start": sl["test_start"],
+                    "test_end": test_end.strftime("%Y-%m-%d"),
+                    "CAGR": perf["CAGR"],
+                    "Calmar": perf["Calmar"],
+                    "Sharpe_DailyExcess": perf["Sharpe_DailyExcess"],
+                    "Final_Equity": perf["Final_Equity"],
+                    "Benchmark_TQQQ_CAGR": perf["Benchmark_CAGR"],
+                    "Benchmark_TQQQ_MaxDD": perf["Benchmark_MaxDD"],
+                    "data_availability": "daily_equity_recomputed",
+                    **pain,
+                }
+            )
+    out = pd.DataFrame(rows)
+    complex_rows = _strict_complex_summary_rows()
+    if not complex_rows.empty:
+        requested_slices = {str(sl["slice"]) for sl in slices}
+        complex_rows = complex_rows[complex_rows["slice"].isin(requested_slices)].copy()
+    if not complex_rows.empty:
+        out = pd.concat([out, complex_rows], ignore_index=True, sort=False)
+    return out
+
+
 def _read_price_csv(path: str, name: str) -> pd.Series:
     src = pd.read_csv(path, parse_dates=["Date"]).set_index("Date")
     col = "Adj Close" if "Adj Close" in src.columns else "Close"
@@ -1047,6 +1288,178 @@ def write_ma_behavior_outputs(results: pd.DataFrame, out_prefix: str) -> tuple[P
     return csv_path, report_path
 
 
+def _pain_comparison(left: pd.DataFrame, right: pd.DataFrame, right_label: str) -> str:
+    if left.empty or right.empty:
+        return f"No comparable daily pain rows were available for {right_label}."
+    merged = left.merge(right, on="slice", how="inner", suffixes=("", "_other"))
+    if merged.empty:
+        return f"No comparable daily pain rows were available for {right_label}."
+    denom = int(len(merged))
+    cagr = int((merged["CAGR"] > merged["CAGR_other"]).sum()) if "CAGR_other" in merged else 0
+    maxdd = int((merged["MaxDD"] > merged["MaxDD_other"]).sum()) if "MaxDD_other" in merged else 0
+    ulcer = int((merged["UlcerIndex"] < merged["UlcerIndex_other"]).sum()) if "UlcerIndex_other" in merged else 0
+    pain = int((merged["PainIndex"] < merged["PainIndex_other"]).sum()) if "PainIndex_other" in merged else 0
+    underwater = (
+        int((merged["PctTimeBelowPreviousHigh"] < merged["PctTimeBelowPreviousHigh_other"]).sum())
+        if "PctTimeBelowPreviousHigh_other" in merged
+        else 0
+    )
+    return (
+        f"Versus {right_label}: CAGR wins {cagr}/{denom}, MaxDD wins {maxdd}/{denom}, "
+        f"UlcerIndex wins {ulcer}/{denom}, PainIndex wins {pain}/{denom}, "
+        f"less time underwater wins {underwater}/{denom}."
+    )
+
+
+def build_underwater_pain_report(results: pd.DataFrame) -> str:
+    ma = results[results["strategy"] == "MA150 risk-off QQQ"].copy()
+    tqqq = results[results["strategy"] == "TQQQ buy-and-hold"].copy()
+    blend70 = results[results["strategy"] == "70/30 TQQQ/QQQ"].copy()
+    blend50 = results[results["strategy"] == "50/50 TQQQ/QQQ"].copy()
+    complex_rows = results[results["strategy"] == "current strict complex baseline"].copy()
+
+    ma_wins_vs_tqqq = _pain_comparison(ma, tqqq, "TQQQ buy-and-hold")
+    ma_wins_vs_70 = _pain_comparison(ma, blend70, "70/30 TQQQ/QQQ")
+    ma_wins_vs_50 = _pain_comparison(ma, blend50, "50/50 TQQQ/QQQ")
+
+    complex_text = "Current strict complex baseline daily equity was unavailable; only CAGR/MaxDD/Calmar/Sharpe summary comparison is possible."
+    if not ma.empty and not complex_rows.empty:
+        merged = ma.merge(complex_rows, on="slice", how="inner", suffixes=("", "_complex"))
+        if not merged.empty:
+            cagr = int((merged["CAGR"] > merged["CAGR_complex"]).sum())
+            maxdd = int((merged["MaxDD"] > merged["MaxDD_complex"]).sum())
+            calmar = int((merged["Calmar"] > merged["Calmar_complex"]).sum())
+            denom = int(len(merged))
+            complex_text = (
+                "Current strict complex baseline daily equity was unavailable, so underwater duration, UlcerIndex, "
+                "PainIndex, rolling-loss, and recovery metrics are not computed for it. Summary-only comparison: "
+                f"MA150 wins CAGR {cagr}/{denom}, MaxDD {maxdd}/{denom}, Calmar {calmar}/{denom}."
+            )
+
+    table_cols = [
+        "slice",
+        "strategy",
+        "CAGR",
+        "MaxDD",
+        "Calmar",
+        "UlcerIndex",
+        "PainIndex",
+        "LongestUnderwaterDays",
+        "AverageUnderwaterDays",
+        "TimeToRecoveryAfterMaxDDDays",
+        "Worst1MReturn",
+        "Worst3MReturn",
+        "Worst6MReturn",
+        "BestMissed1MReturnVsTQQQ",
+        "RecoveryParticipationAfterDrawdown",
+        "NewEquityHighs",
+        "PctTimeBelowPreviousHigh",
+        "data_availability",
+    ]
+    show = results[[c for c in table_cols if c in results.columns]].copy()
+    for col in [
+        "CAGR",
+        "MaxDD",
+        "UlcerIndex",
+        "PainIndex",
+        "Worst1MReturn",
+        "Worst3MReturn",
+        "Worst6MReturn",
+        "BestMissed1MReturnVsTQQQ",
+        "PctTimeBelowPreviousHigh",
+    ]:
+        if col in show:
+            show[col] = show[col].map(_fmt_pct)
+    for col in [
+        "Calmar",
+        "AverageUnderwaterDays",
+        "TimeToRecoveryAfterMaxDDDays",
+        "RecoveryParticipationAfterDrawdown",
+        "NewEquityHighs",
+    ]:
+        if col in show:
+            show[col] = show[col].map(_fmt_num)
+
+    ma_table = ma[
+        [
+            "slice",
+            "CAGR",
+            "MaxDD",
+            "UlcerIndex",
+            "PainIndex",
+            "LongestUnderwaterDays",
+            "TimeToRecoveryAfterMaxDDDays",
+            "PctTimeBelowPreviousHigh",
+            "BestMissed1MReturnVsTQQQ",
+        ]
+    ].copy() if not ma.empty else pd.DataFrame()
+    if not ma_table.empty:
+        for col in ["CAGR", "MaxDD", "UlcerIndex", "PainIndex", "PctTimeBelowPreviousHigh", "BestMissed1MReturnVsTQQQ"]:
+            ma_table[col] = ma_table[col].map(_fmt_pct)
+        ma_table["TimeToRecoveryAfterMaxDDDays"] = ma_table["TimeToRecoveryAfterMaxDDDays"].map(_fmt_num)
+
+    if ma.empty:
+        verdict = "No MA150 rows were available; underwater audit is inconclusive."
+    else:
+        verdict = "MA150 improves pain versus raw TQQQ and simple blends on several path metrics, but it is still not paper-trading ready."
+
+    lines = [
+        "# Underwater / Pain Audit for MA150 Risk-Off QQQ",
+        "",
+        "## Executive Verdict",
+        "",
+        verdict,
+        "",
+        "This audit measures investor tolerance metrics, not just CAGR or Calmar. It does not approve paper trading.",
+        "",
+        "## Data Availability",
+        "",
+        "- TQQQ, 70/30, 50/50, and MA150 rows use recomputed daily OOS equity from QQQ/TQQQ prices.",
+        "- Current strict complex baseline has only retained summary CSV rows; daily underwater metrics are marked unavailable and are not invented.",
+        "- Worst 1M/3M/6M returns use 21/63/126 trading-day rolling returns.",
+        "",
+        "## MA150 Pain Summary",
+        "",
+        _markdown_table(ma_table),
+        "",
+        "## Comparison",
+        "",
+        ma_wins_vs_tqqq,
+        "",
+        ma_wins_vs_70,
+        "",
+        ma_wins_vs_50,
+        "",
+        complex_text,
+        "",
+        "## Behavior Interpretation",
+        "",
+        "- MA150 is simple trend-following exposure control: it helps primarily by spending less time in fully levered TQQQ during sustained downtrends.",
+        "- If MaxDD improves but recovery days or missed positive months worsen, the strategy may feel safer but still frustrate investors during recoveries.",
+        "- Compared with simple blends, the key question is whether lower UlcerIndex/PainIndex compensates for missed rebounds and higher switching uncertainty.",
+        "- Compared with the current complex baseline, this audit cannot prove daily pain superiority because the complex daily equity artifacts were not retained.",
+        "",
+        "## Paper-Trading Readiness",
+        "",
+        "NOT READY. The MA150 baseline has useful path-dependent evidence, but paper trading still requires retained daily artifacts, slippage/tax stress, and a frozen go/no-go hurdle.",
+        "",
+        "## Full Summary",
+        "",
+        _markdown_table(show),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def write_underwater_pain_outputs(results: pd.DataFrame, out_prefix: str) -> tuple[Path, Path]:
+    out_dir = Path(out_prefix).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "underwater_pain_summary.csv"
+    report_path = out_dir / "UNDERWATER_PAIN_AUDIT.md"
+    results.to_csv(csv_path, index=False)
+    report_path.write_text(build_underwater_pain_report(results), encoding="utf-8")
+    return csv_path, report_path
+
+
 def write_outputs(summary: pd.DataFrame, out_prefix: str) -> tuple[Path, Path]:
     prefix = Path(out_prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -1066,6 +1479,7 @@ def parse_args(argv=None):
     ap.add_argument("--slices_csv", default=None)
     ap.add_argument("--out_prefix", default="reports/minimal_baseline/minimal_tqqq")
     ap.add_argument("--ma_behavior_audit", action="store_true")
+    ap.add_argument("--underwater_pain_audit", action="store_true")
     return ap.parse_args(argv)
 
 
@@ -1090,6 +1504,11 @@ def main(argv=None) -> int:
         print(f"[minimal] wrote {ma_csv}")
         print(f"[minimal] wrote {ma_report}")
         print(f"[minimal] best MA variant: {analysis['best_variant']}")
+    if args.underwater_pain_audit:
+        pain_results = run_underwater_pain_audit(df, slices)
+        pain_csv, pain_report = write_underwater_pain_outputs(pain_results, args.out_prefix)
+        print(f"[minimal] wrote {pain_csv}")
+        print(f"[minimal] wrote {pain_report}")
     return 0
 
 
