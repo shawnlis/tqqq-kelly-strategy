@@ -1948,6 +1948,348 @@ def write_cost_stress_outputs(results: pd.DataFrame, out_prefix: str) -> tuple[P
     return csv_path, report_path
 
 
+def _average_holding_period_from_turnover(turnover: pd.Series, eps: float = 1e-12) -> float:
+    ser = pd.Series(turnover).fillna(0.0).astype(float)
+    if ser.empty:
+        return float("nan")
+    change_positions = np.flatnonzero(ser.to_numpy() > eps)
+    boundaries = [0]
+    boundaries.extend(int(x) for x in change_positions if int(x) > 0)
+    boundaries.append(len(ser))
+    boundaries = sorted(set(boundaries))
+    lengths = [b - a for a, b in zip(boundaries[:-1], boundaries[1:]) if b > a]
+    return float(np.mean(lengths)) if lengths else float(len(ser))
+
+
+def calculate_turnover_tax_event_proxy(weights: pd.DataFrame) -> dict:
+    """Estimate turnover, trade-event, and sell-side tax-event proxies.
+
+    This is intentionally not tax advice. It only measures observable trading
+    events in the backtest weights: buy-side changes, sell-side changes, and
+    turnover. Actual tax treatment depends on jurisdiction and account type.
+    """
+    eff = _effective_weights_for_cost(weights, 0)
+    eff.index = pd.to_datetime(eff.index)
+    risky = eff[["w_tqqq", "w_qqq"]].astype(float)
+    prev = risky.shift(1).fillna(0.0)
+    delta = risky - prev
+    buy_notional = delta.clip(lower=0.0).sum(axis=1)
+    sell_notional = (-delta.clip(upper=0.0)).sum(axis=1)
+    turnover = buy_notional + sell_notional
+    ongoing_turnover = turnover.copy()
+    if len(ongoing_turnover) > 0:
+        ongoing_turnover.iloc[0] = 0.0
+
+    years = max(len(eff) / PERIODS_PER_YEAR, 1e-12)
+    trade_days = int((turnover > 1e-12).sum())
+    ongoing_trade_days = int((ongoing_turnover > 1e-12).sum())
+    buy_events = int((buy_notional > 1e-12).sum())
+    sell_events = int((sell_notional > 1e-12).sum())
+
+    annual_turnover = turnover.groupby(turnover.index.year).sum()
+    annual_ongoing_turnover = ongoing_turnover.groupby(ongoing_turnover.index.year).sum()
+    annual_trade_days = ongoing_turnover.groupby(ongoing_turnover.index.year).apply(lambda x: int((x > 1e-12).sum()))
+    average_holding_period = _average_holding_period_from_turnover(turnover)
+    short_holding_risk_proxy = (
+        float(min(1.0, 30.0 / average_holding_period))
+        if np.isfinite(average_holding_period) and average_holding_period > 0.0
+        else float("nan")
+    )
+    pct_years_no_trades = float((annual_trade_days == 0).mean()) if len(annual_trade_days) else float("nan")
+    max_annual_turnover = float(annual_turnover.max()) if len(annual_turnover) else 0.0
+    worst_calendar_year = str(int(annual_turnover.idxmax())) if len(annual_turnover) else ""
+    worst_calendar_year_ongoing = (
+        str(int(annual_ongoing_turnover.idxmax())) if len(annual_ongoing_turnover) else ""
+    )
+    ongoing_max_annual_turnover = float(annual_ongoing_turnover.max()) if len(annual_ongoing_turnover) else 0.0
+    operational_burden_score = float(
+        min(
+            100.0,
+            2.0 * (trade_days / years)
+            + 4.0 * (ongoing_trade_days / years)
+            + 3.0 * (float(turnover.sum()) / years)
+            + 1.5 * max_annual_turnover
+            + 15.0 * (short_holding_risk_proxy if np.isfinite(short_holding_risk_proxy) else 0.0),
+        )
+    )
+
+    return {
+        "turnover_series": turnover.rename("Turnover"),
+        "buy_notional_series": buy_notional.rename("BuyNotionalProxy"),
+        "sell_notional_series": sell_notional.rename("SellNotionalProxy"),
+        "annual_turnover_by_year": {str(int(k)): float(v) for k, v in annual_turnover.items()},
+        "annual_ongoing_turnover_by_year": {str(int(k)): float(v) for k, v in annual_ongoing_turnover.items()},
+        "trades_per_year": float(trade_days / years),
+        "switches_per_year": float(ongoing_trade_days / years),
+        "average_turnover_per_year": float(turnover.sum() / years),
+        "max_annual_turnover": max_annual_turnover,
+        "number_sell_events": sell_events,
+        "number_buy_events": buy_events,
+        "estimated_taxable_events_proxy": sell_events,
+        "taxable_sell_notional_proxy": float(sell_notional.sum()),
+        "average_holding_period_proxy_days": average_holding_period,
+        "short_holding_risk_proxy": short_holding_risk_proxy,
+        "percentage_years_with_no_trades": pct_years_no_trades,
+        "worst_calendar_year_turnover": max_annual_turnover,
+        "worst_calendar_year": worst_calendar_year,
+        "ongoing_max_annual_turnover": ongoing_max_annual_turnover,
+        "worst_calendar_year_ongoing_turnover": ongoing_max_annual_turnover,
+        "worst_calendar_year_ongoing": worst_calendar_year_ongoing,
+        "operational_burden_score": operational_burden_score,
+        "trade_days": trade_days,
+        "ongoing_trade_days": ongoing_trade_days,
+        "total_turnover": float(turnover.sum()),
+        "ongoing_turnover": float(ongoing_turnover.sum()),
+    }
+
+
+def run_operational_feasibility_audit(
+    df: pd.DataFrame,
+    strict_slices: Iterable[dict] | None = None,
+) -> pd.DataFrame:
+    """Audit operational burden and sell-side event proxies for fixed baselines."""
+    px = _require_price_frame(df)
+    slices = list(strict_slices or default_strict_slices(px))
+    rows = []
+    for sl in slices:
+        train_start = pd.Timestamp(sl["train_start"])
+        test_start = pd.Timestamp(sl["test_start"])
+        test_end = min(pd.Timestamp(sl["test_end"]), pd.Timestamp(px.index.max()))
+        df_slice = px.loc[(px.index >= train_start) & (px.index <= test_end)].copy()
+        if df_slice.empty:
+            continue
+        oos_index = df_slice.loc[(df_slice.index >= test_start) & (df_slice.index <= test_end)].index
+        if len(oos_index) < 2:
+            continue
+
+        benchmark = _normalize(_equity_from_returns(_price_returns(df_slice).reindex(oos_index).fillna(0.0)["TQQQ"]))
+        for label, family, fn in _cost_strategy_specs():
+            result = fn(df_slice)
+            weights_oos = result["weights"].reindex(oos_index).dropna(how="all")
+            equity_oos = _normalize(result["equity"].reindex(oos_index))
+            metrics = compute_performance_metrics(
+                equity_oos,
+                benchmark_equity=benchmark,
+                rf_ann=DEFAULT_RF_ANN,
+                periods_per_year=PERIODS_PER_YEAR,
+            )
+            proxy = calculate_turnover_tax_event_proxy(weights_oos)
+            row = {
+                "slice": sl["slice"],
+                "strategy": label,
+                "family": family,
+                "train_start": sl["train_start"],
+                "train_end": sl["train_end"],
+                "test_start": sl["test_start"],
+                "test_end": test_end.strftime("%Y-%m-%d"),
+                "CAGR": metrics["CAGR"],
+                "MaxDD": metrics["MaxDD"],
+                "Calmar": metrics["Calmar"],
+                "Final_Equity": metrics["Final_Equity"],
+                "trades_per_year": proxy["trades_per_year"],
+                "switches_per_year": proxy["switches_per_year"],
+                "average_turnover_per_year": proxy["average_turnover_per_year"],
+                "max_annual_turnover": proxy["max_annual_turnover"],
+                "number_sell_events": proxy["number_sell_events"],
+                "number_buy_events": proxy["number_buy_events"],
+                "estimated_taxable_events_proxy": proxy["estimated_taxable_events_proxy"],
+                "taxable_sell_notional_proxy": proxy["taxable_sell_notional_proxy"],
+                "average_holding_period_proxy_days": proxy["average_holding_period_proxy_days"],
+                "short_holding_risk_proxy": proxy["short_holding_risk_proxy"],
+                "percentage_years_with_no_trades": proxy["percentage_years_with_no_trades"],
+                "worst_calendar_year_turnover": proxy["worst_calendar_year_turnover"],
+                "worst_calendar_year": proxy["worst_calendar_year"],
+                "ongoing_max_annual_turnover": proxy["ongoing_max_annual_turnover"],
+                "worst_calendar_year_ongoing_turnover": proxy["worst_calendar_year_ongoing_turnover"],
+                "worst_calendar_year_ongoing": proxy["worst_calendar_year_ongoing"],
+                "operational_burden_score": proxy["operational_burden_score"],
+                "trade_days": proxy["trade_days"],
+                "ongoing_trade_days": proxy["ongoing_trade_days"],
+                "total_turnover": proxy["total_turnover"],
+                "ongoing_turnover": proxy["ongoing_turnover"],
+                "PeriodicRebalance": False,
+                "TaxAdvice": False,
+            }
+            rows.append(row)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    for benchmark_strategy, suffix in [
+        ("70/30 TQQQ/QQQ", "70_30"),
+        ("50/50 TQQQ/QQQ", "50_50"),
+        ("TQQQ buy-and-hold", "tqqq_buy_hold"),
+    ]:
+        bench = out[out["strategy"] == benchmark_strategy][
+            ["slice", "operational_burden_score", "trades_per_year", "average_turnover_per_year"]
+        ].rename(
+            columns={
+                "operational_burden_score": f"burden_score_{suffix}",
+                "trades_per_year": f"trades_per_year_{suffix}",
+                "average_turnover_per_year": f"turnover_per_year_{suffix}",
+            }
+        )
+        out = out.merge(bench, on="slice", how="left")
+        out[f"extra_burden_vs_{suffix}"] = out["operational_burden_score"] - out[f"burden_score_{suffix}"]
+        out[f"extra_trades_per_year_vs_{suffix}"] = out["trades_per_year"] - out[f"trades_per_year_{suffix}"]
+        out[f"extra_turnover_per_year_vs_{suffix}"] = (
+            out["average_turnover_per_year"] - out[f"turnover_per_year_{suffix}"]
+        )
+    return out
+
+
+def _operational_comparison_line(results: pd.DataFrame, benchmark_strategy: str) -> str:
+    ma = results[results["strategy"] == "MA150 risk-off QQQ"].copy()
+    other = results[results["strategy"] == benchmark_strategy].copy()
+    if ma.empty or other.empty:
+        return f"MA150 versus {benchmark_strategy}: unavailable."
+    merged = ma.merge(other, on="slice", how="inner", suffixes=("", "_other"))
+    if merged.empty:
+        return f"MA150 versus {benchmark_strategy}: unavailable."
+    return (
+        f"MA150 versus {benchmark_strategy}: mean extra trades/year "
+        f"{_fmt_num((merged['trades_per_year'] - merged['trades_per_year_other']).mean())}, "
+        f"mean extra annual turnover {_fmt_num((merged['average_turnover_per_year'] - merged['average_turnover_per_year_other']).mean())}, "
+        f"mean extra operational burden score "
+        f"{_fmt_num((merged['operational_burden_score'] - merged['operational_burden_score_other']).mean())}."
+    )
+
+
+def build_operational_feasibility_report(results: pd.DataFrame) -> str:
+    ma = results[results["strategy"] == "MA150 risk-off QQQ"].copy()
+    if ma.empty:
+        verdict = "Operational feasibility audit is inconclusive because no MA150 rows were generated."
+        ma_show = pd.DataFrame()
+    else:
+        verdict = (
+            "MA150 is operationally feasible for continued research, but the added trade events versus "
+            "static blends keep the decision at HOLD and NOT READY FOR PAPER TRADING."
+        )
+        ma_show = ma[
+            [
+                "slice",
+                "trades_per_year",
+                "switches_per_year",
+                "average_turnover_per_year",
+                "max_annual_turnover",
+                "number_sell_events",
+                "number_buy_events",
+                "estimated_taxable_events_proxy",
+                "taxable_sell_notional_proxy",
+                "average_holding_period_proxy_days",
+                "percentage_years_with_no_trades",
+                "operational_burden_score",
+            ]
+        ].copy()
+        for col in ma_show.columns:
+            if col != "slice":
+                ma_show[col] = ma_show[col].map(_fmt_num)
+
+    agg = pd.DataFrame()
+    if not results.empty:
+        agg = results.groupby("strategy", as_index=False).agg(
+            MeanTradesPerYear=("trades_per_year", "mean"),
+            MeanSwitchesPerYear=("switches_per_year", "mean"),
+            MeanAnnualTurnover=("average_turnover_per_year", "mean"),
+            MeanSellEvents=("number_sell_events", "mean"),
+            MeanTaxableSellNotionalProxy=("taxable_sell_notional_proxy", "mean"),
+            MeanHoldingPeriodProxyDays=("average_holding_period_proxy_days", "mean"),
+            MeanOperationalBurdenScore=("operational_burden_score", "mean"),
+        )
+        for col in agg.columns:
+            if col != "strategy":
+                agg[col] = agg[col].map(_fmt_num)
+
+    show = results[
+        [
+            "slice",
+            "strategy",
+            "trades_per_year",
+            "switches_per_year",
+            "average_turnover_per_year",
+            "max_annual_turnover",
+            "number_sell_events",
+            "number_buy_events",
+            "estimated_taxable_events_proxy",
+            "taxable_sell_notional_proxy",
+            "average_holding_period_proxy_days",
+            "percentage_years_with_no_trades",
+            "operational_burden_score",
+            "PeriodicRebalance",
+        ]
+    ].copy() if not results.empty else pd.DataFrame()
+    if not show.empty:
+        for col in [
+            "trades_per_year",
+            "switches_per_year",
+            "average_turnover_per_year",
+            "max_annual_turnover",
+            "number_sell_events",
+            "number_buy_events",
+            "estimated_taxable_events_proxy",
+            "taxable_sell_notional_proxy",
+            "average_holding_period_proxy_days",
+            "percentage_years_with_no_trades",
+            "operational_burden_score",
+        ]:
+            show[col] = show[col].map(_fmt_num)
+
+    lines = [
+        "# Operational Feasibility Audit for MA150 Risk-Off QQQ",
+        "",
+        "## Executive Verdict",
+        "",
+        verdict,
+        "",
+        "Current decision: HOLD. Paper-trading status: NOT READY FOR PAPER TRADING.",
+        "",
+        "## Scope And Tax Disclaimer",
+        "",
+        "- This audit measures turnover, trade events, sell-side event proxies, and operational burden.",
+        "- It does not provide formal tax advice.",
+        "- Tax treatment depends on jurisdiction/account type and requires professional advice.",
+        "- For a Singapore-based investor, practical concerns often include operating discipline, USD products, broker execution, reporting, and estate tax / withholding considerations rather than only US-style short-term capital gains. This is not a legal conclusion.",
+        "- Static blends are modeled as buy-and-hold with no periodic rebalance; they only have the initial OOS allocation event.",
+        "",
+        "## MA150 Summary",
+        "",
+        _markdown_table(ma_show),
+        "",
+        "## Comparison Versus Static Blends",
+        "",
+        _operational_comparison_line(results, "TQQQ buy-and-hold"),
+        _operational_comparison_line(results, "70/30 TQQQ/QQQ"),
+        _operational_comparison_line(results, "50/50 TQQQ/QQQ"),
+        "",
+        "## Strategy-Level Operational Burden",
+        "",
+        _markdown_table(agg),
+        "",
+        "## Feasibility Interpretation",
+        "",
+        "- MA150 is materially more complex than buy-and-hold or static blends because it can require sell-side events during regime switches.",
+        "- The strategy is still simple enough to execute manually at low frequency, but paper-trading evidence should include retained daily artifacts and an operator checklist.",
+        "- Automation is useful for consistency and audit logs, but the rule should remain manually understandable before any live or paper workflow.",
+        "- The sell-side taxable-event proxy is not a tax estimate; it only flags that realized-sale events may exist in taxable accounts.",
+        "- If operational burden or taxable-event proxy offsets the pain/Calmar improvement, the MA strategy should remain research-only.",
+        "",
+        "## Full Summary",
+        "",
+        _markdown_table(show),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def write_operational_feasibility_outputs(results: pd.DataFrame, out_prefix: str) -> tuple[Path, Path]:
+    out_dir = Path(out_prefix).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "operational_feasibility_summary.csv"
+    report_path = out_dir / "OPERATIONAL_FEASIBILITY_AUDIT.md"
+    results.to_csv(csv_path, index=False)
+    report_path.write_text(build_operational_feasibility_report(results), encoding="utf-8")
+    return csv_path, report_path
+
+
 def write_outputs(summary: pd.DataFrame, out_prefix: str) -> tuple[Path, Path]:
     prefix = Path(out_prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -1973,6 +2315,7 @@ def parse_args(argv=None):
     ap.add_argument("--cost_stress_audit", action="store_true")
     ap.add_argument("--cost_bps_list", default="0,5,10,25,50")
     ap.add_argument("--execution_delay_days", type=int, default=0)
+    ap.add_argument("--operational_feasibility_audit", action="store_true")
     return ap.parse_args(argv)
 
 
@@ -2015,6 +2358,14 @@ def main(argv=None) -> int:
         cost_csv, cost_report = write_cost_stress_outputs(cost_results, args.out_prefix)
         print(f"[minimal] wrote {cost_csv}")
         print(f"[minimal] wrote {cost_report}")
+    if args.operational_feasibility_audit:
+        operational_results = run_operational_feasibility_audit(df, slices)
+        operational_csv, operational_report = write_operational_feasibility_outputs(
+            operational_results,
+            args.out_prefix,
+        )
+        print(f"[minimal] wrote {operational_csv}")
+        print(f"[minimal] wrote {operational_report}")
     return 0
 
 
