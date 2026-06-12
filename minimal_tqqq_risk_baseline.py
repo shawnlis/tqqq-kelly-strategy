@@ -949,6 +949,219 @@ def save_daily_artifacts(
     return paths
 
 
+def _cost_strategy_specs() -> list[tuple[str, str, callable]]:
+    return [
+        ("TQQQ buy-and-hold", "raw_tqqq", lambda d: run_static_blend_backtest(d, 1.0, 0.0, 0.0)),
+        ("70/30 TQQQ/QQQ", "static_blend", lambda d: run_static_blend_backtest(d, 0.7, 0.3, 0.0)),
+        ("50/50 TQQQ/QQQ", "static_blend", lambda d: run_static_blend_backtest(d, 0.5, 0.5, 0.0)),
+        (
+            "MA150 risk-off QQQ",
+            "ma_regime",
+            lambda d: run_ma_regime_backtest(d, {"ma_window": 150, "risk_off_asset": "qqq", "confirmation_days": 1}),
+        ),
+        (
+            "MA200 risk-off QQQ",
+            "ma_regime",
+            lambda d: run_ma_regime_backtest(d, {"ma_window": 200, "risk_off_asset": "qqq", "confirmation_days": 1}),
+        ),
+        (
+            "MA150 risk-off cash",
+            "ma_regime",
+            lambda d: run_ma_regime_backtest(d, {"ma_window": 150, "risk_off_asset": "cash", "confirmation_days": 1}),
+        ),
+    ]
+
+
+def _effective_weights_for_cost(weights: pd.DataFrame, execution_delay_days: int = 0) -> pd.DataFrame:
+    cols = ["w_tqqq", "w_qqq", "w_cash"]
+    missing = set(cols) - set(weights.columns)
+    if missing:
+        raise ValueError(f"weights missing columns: {sorted(missing)}")
+    delay = int(execution_delay_days)
+    if delay < 0:
+        raise ValueError("execution_delay_days must be >= 0.")
+    out = weights[cols].copy().astype(float)
+    if delay > 0:
+        out = out.shift(delay)
+        out["w_tqqq"] = out["w_tqqq"].fillna(0.0)
+        out["w_qqq"] = out["w_qqq"].fillna(0.0)
+        out["w_cash"] = out["w_cash"].fillna(1.0)
+    out = out.fillna({"w_tqqq": 0.0, "w_qqq": 0.0, "w_cash": 1.0})
+    out["effective_leverage"] = 3.0 * out["w_tqqq"] + out["w_qqq"]
+    return out
+
+
+def calculate_turnover_stats(weights: pd.DataFrame, cost_bps: float = 0.0) -> dict:
+    """Calculate one-way turnover from risky asset weight changes."""
+    eff = _effective_weights_for_cost(weights, 0)
+    risky = eff[["w_tqqq", "w_qqq"]]
+    prev = risky.shift(1).fillna(0.0)
+    turnover = (risky - prev).abs().sum(axis=1)
+    years = max(len(eff) / PERIODS_PER_YEAR, 1e-12)
+    cost_rate = turnover * (float(cost_bps) / 10000.0)
+    return {
+        "turnover_series": turnover,
+        "cost_rate_series": cost_rate,
+        "total_turnover": float(turnover.sum()),
+        "annualized_turnover": float(turnover.sum() / years),
+        "trade_days": int((turnover > 1e-12).sum()),
+        "avg_turnover_on_trade_days": float(turnover[turnover > 1e-12].mean()) if (turnover > 1e-12).any() else 0.0,
+        "total_cost_rate": float(cost_rate.sum()),
+    }
+
+
+def apply_trade_cost_to_equity(
+    df: pd.DataFrame,
+    weights: pd.DataFrame,
+    cost_bps: float = 0.0,
+    execution_delay_days: int = 0,
+    oos_index: Iterable | None = None,
+) -> dict:
+    """Apply one-way transaction costs to daily equity from target weights.
+
+    Costs are charged only on changes in risky asset weights. The first OOS row
+    includes the cost of establishing the current risky allocation from cash.
+    """
+    px = _require_price_frame(df)
+    ret = _price_returns(px)
+    eff_weights = _effective_weights_for_cost(weights.reindex(px.index), int(execution_delay_days))
+    if oos_index is None:
+        idx = px.index
+    else:
+        idx = pd.Index(pd.to_datetime(list(oos_index)))
+    eff_weights = eff_weights.reindex(idx).fillna({"w_tqqq": 0.0, "w_qqq": 0.0, "w_cash": 1.0, "effective_leverage": 0.0})
+    ret = ret.reindex(idx).fillna(0.0)
+
+    gross_ret = eff_weights["w_tqqq"] * ret["TQQQ"] + eff_weights["w_qqq"] * ret["QQQ"]
+    if len(gross_ret) > 0:
+        gross_ret.iloc[0] = 0.0
+
+    risky = eff_weights[["w_tqqq", "w_qqq"]]
+    prev = risky.shift(1).fillna(0.0)
+    turnover = (risky - prev).abs().sum(axis=1)
+    cost_rate = turnover * (float(cost_bps) / 10000.0)
+    net_ret = (1.0 + gross_ret) * (1.0 - cost_rate) - 1.0
+    net_equity = _equity_from_returns(net_ret)
+    gross_equity = _equity_from_returns(gross_ret)
+    return {
+        "equity": net_equity,
+        "gross_equity": gross_equity,
+        "daily_returns": net_ret.rename("DailyReturnAfterCost"),
+        "gross_daily_returns": gross_ret.rename("GrossDailyReturn"),
+        "turnover": turnover.rename("Turnover"),
+        "cost_rate": cost_rate.rename("TradeCostRate"),
+        "weights": eff_weights,
+        "final_cost_drag": float(gross_equity.iloc[-1] - net_equity.iloc[-1]) if len(net_equity) else 0.0,
+        "total_cost_rate": float(cost_rate.sum()),
+    }
+
+
+def _parse_cost_bps_list(value: str | Iterable[float] | None) -> list[float]:
+    if value is None:
+        return [0.0, 5.0, 10.0, 25.0, 50.0]
+    if isinstance(value, str):
+        return [float(x.strip()) for x in value.split(",") if x.strip()]
+    return [float(x) for x in value]
+
+
+def _cost_scenarios(cost_bps_list: str | Iterable[float] | None = None, execution_delay_days: int = 0) -> list[dict]:
+    scenarios = []
+    seen = set()
+    for bps in _parse_cost_bps_list(cost_bps_list):
+        key = (float(bps), int(execution_delay_days))
+        if key in seen:
+            continue
+        seen.add(key)
+        if float(bps) == 0.0 and int(execution_delay_days) == 0:
+            name = "base_0bps"
+        else:
+            name = f"cost_{int(float(bps)) if float(bps).is_integer() else bps}bps_delay{int(execution_delay_days)}d"
+        scenarios.append({"scenario": name, "cost_bps": float(bps), "execution_delay_days": int(execution_delay_days)})
+    if int(execution_delay_days) == 0:
+        for bps in [10.0, 25.0]:
+            key = (bps, 1)
+            if key not in seen:
+                seen.add(key)
+                scenarios.append({"scenario": f"stress_{int(bps)}bps_delay1d", "cost_bps": bps, "execution_delay_days": 1})
+    return scenarios
+
+
+def run_cost_stress_suite(
+    df: pd.DataFrame,
+    strict_slices: Iterable[dict] | None = None,
+    cost_bps_list: str | Iterable[float] | None = None,
+    execution_delay_days: int = 0,
+) -> pd.DataFrame:
+    """Run fixed cost and delay stress scenarios for minimal baselines."""
+    px = _require_price_frame(df)
+    slices = list(strict_slices or default_strict_slices(px))
+    scenarios = _cost_scenarios(cost_bps_list, execution_delay_days)
+    rows = []
+    for sl in slices:
+        train_start = pd.Timestamp(sl["train_start"])
+        test_start = pd.Timestamp(sl["test_start"])
+        test_end = min(pd.Timestamp(sl["test_end"]), pd.Timestamp(px.index.max()))
+        df_slice = px.loc[(px.index >= train_start) & (px.index <= test_end)].copy()
+        if df_slice.empty:
+            continue
+        oos_index = df_slice.loc[(df_slice.index >= test_start) & (df_slice.index <= test_end)].index
+        if len(oos_index) < 2:
+            continue
+        benchmark = _equity_from_returns(_price_returns(df_slice).reindex(oos_index).fillna(0.0)["TQQQ"])
+        if len(benchmark) > 0:
+            benchmark = _normalize(benchmark)
+
+        for label, family, fn in _cost_strategy_specs():
+            result = fn(df_slice)
+            for scenario in scenarios:
+                cost_result = apply_trade_cost_to_equity(
+                    df_slice,
+                    result["weights"],
+                    cost_bps=scenario["cost_bps"],
+                    execution_delay_days=scenario["execution_delay_days"],
+                    oos_index=oos_index,
+                )
+                equity = cost_result["equity"]
+                metrics = compute_performance_metrics(
+                    equity,
+                    benchmark_equity=benchmark,
+                    rf_ann=DEFAULT_RF_ANN,
+                    periods_per_year=PERIODS_PER_YEAR,
+                )
+                turnover_stats = calculate_turnover_stats(cost_result["weights"], scenario["cost_bps"])
+                rows.append(
+                    {
+                        "slice": sl["slice"],
+                        "strategy": label,
+                        "family": family,
+                        "scenario": scenario["scenario"],
+                        "cost_bps": scenario["cost_bps"],
+                        "execution_delay_days": scenario["execution_delay_days"],
+                        "train_start": sl["train_start"],
+                        "train_end": sl["train_end"],
+                        "test_start": sl["test_start"],
+                        "test_end": test_end.strftime("%Y-%m-%d"),
+                        "CAGR": metrics["CAGR"],
+                        "MaxDD": metrics["MaxDD"],
+                        "Calmar": metrics["Calmar"],
+                        "Sharpe_DailyExcess": metrics["Sharpe_DailyExcess"],
+                        "Final_Equity": metrics["Final_Equity"],
+                        "Benchmark_TQQQ_CAGR": metrics["Benchmark_CAGR"],
+                        "Benchmark_TQQQ_MaxDD": metrics["Benchmark_MaxDD"],
+                        "total_turnover": turnover_stats["total_turnover"],
+                        "annualized_turnover": turnover_stats["annualized_turnover"],
+                        "trade_days": turnover_stats["trade_days"],
+                        "avg_turnover_on_trade_days": turnover_stats["avg_turnover_on_trade_days"],
+                        "total_cost_rate": turnover_stats["total_cost_rate"],
+                        "final_cost_drag": cost_result["final_cost_drag"],
+                        "MaxEffectiveLeverage": float(cost_result["weights"]["effective_leverage"].max()),
+                        "AvgEffectiveLeverage": float(cost_result["weights"]["effective_leverage"].mean()),
+                        "PeriodicRebalance": False,
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
 def _read_price_csv(path: str, name: str) -> pd.Series:
     src = pd.read_csv(path, parse_dates=["Date"]).set_index("Date")
     col = "Adj Close" if "Adj Close" in src.columns else "Close"
@@ -1551,6 +1764,190 @@ def write_underwater_pain_outputs(results: pd.DataFrame, out_prefix: str) -> tup
     return csv_path, report_path
 
 
+def _cost_win_line(results: pd.DataFrame, scenario: str, benchmark_strategy: str) -> str:
+    ma = results[(results["strategy"] == "MA150 risk-off QQQ") & (results["scenario"] == scenario)].copy()
+    other = results[(results["strategy"] == benchmark_strategy) & (results["scenario"] == scenario)].copy()
+    if ma.empty or other.empty:
+        return f"{scenario} versus {benchmark_strategy}: unavailable."
+    merged = ma.merge(other, on="slice", how="inner", suffixes=("", "_other"))
+    if merged.empty:
+        return f"{scenario} versus {benchmark_strategy}: unavailable."
+    denom = int(len(merged))
+    return (
+        f"{scenario} versus {benchmark_strategy}: CAGR wins {int((merged['CAGR'] > merged['CAGR_other']).sum())}/{denom}, "
+        f"Calmar wins {int((merged['Calmar'] > merged['Calmar_other']).sum())}/{denom}, "
+        f"MaxDD wins {int((merged['MaxDD'] > merged['MaxDD_other']).sum())}/{denom}, "
+        f"Final equity wins {int((merged['Final_Equity'] > merged['Final_Equity_other']).sum())}/{denom}."
+    )
+
+
+def _delay_impact_line(results: pd.DataFrame, cost_bps: float) -> str:
+    no_delay_name = f"cost_{int(cost_bps)}bps_delay0d"
+    delay_name = f"stress_{int(cost_bps)}bps_delay1d"
+    ma_base = results[(results["strategy"] == "MA150 risk-off QQQ") & (results["scenario"] == no_delay_name)].copy()
+    ma_delay = results[(results["strategy"] == "MA150 risk-off QQQ") & (results["scenario"] == delay_name)].copy()
+    if ma_base.empty or ma_delay.empty:
+        return f"{int(cost_bps)} bps delay impact: unavailable."
+    merged = ma_base.merge(ma_delay, on="slice", how="inner", suffixes=("_no_delay", "_delay"))
+    if merged.empty:
+        return f"{int(cost_bps)} bps delay impact: unavailable."
+    calmar_delta = float((merged["Calmar_delay"] - merged["Calmar_no_delay"]).mean())
+    cagr_delta = float((merged["CAGR_delay"] - merged["CAGR_no_delay"]).mean())
+    final_delta = float((merged["Final_Equity_delay"] - merged["Final_Equity_no_delay"]).mean())
+    worse = int((merged["Final_Equity_delay"] < merged["Final_Equity_no_delay"]).sum())
+    return (
+        f"{int(cost_bps)} bps + one-day delay: final equity worsened in {worse}/{len(merged)} slices; "
+        f"mean CAGR delta {_fmt_pct(cagr_delta)}, mean Calmar delta {_fmt_num(calmar_delta)}, "
+        f"mean final-equity delta {_fmt_num(final_delta)}."
+    )
+
+
+def build_cost_stress_report(results: pd.DataFrame) -> str:
+    ma = results[results["strategy"] == "MA150 risk-off QQQ"].copy()
+    static = results[results["family"].isin(["raw_tqqq", "static_blend"])].copy()
+    ma_base = ma[ma["scenario"] == "base_0bps"].copy()
+
+    if ma.empty:
+        verdict = "Cost stress audit is inconclusive because no MA150 rows were generated."
+    else:
+        verdict = "MA150 remains a research candidate under moderate costs, but cost/delay stress is mixed and it is still NOT READY FOR PAPER TRADING."
+
+    scenario_lines = []
+    for scenario in ["cost_10bps_delay0d", "cost_25bps_delay0d", "cost_50bps_delay0d"]:
+        scenario_lines.append(_cost_win_line(results, scenario, "70/30 TQQQ/QQQ"))
+        scenario_lines.append(_cost_win_line(results, scenario, "50/50 TQQQ/QQQ"))
+
+    delay_lines = [_delay_impact_line(results, 10.0), _delay_impact_line(results, 25.0)]
+
+    turnover_text = "Turnover unavailable."
+    if not ma.empty:
+        ma_turnover = ma.groupby("scenario", as_index=False).agg(
+            MeanAnnualizedTurnover=("annualized_turnover", "mean"),
+            MeanTradeDays=("trade_days", "mean"),
+            MeanCostDrag=("final_cost_drag", "mean"),
+        )
+        static_turnover = static.groupby("strategy", as_index=False).agg(
+            MeanTradeDays=("trade_days", "mean"),
+            MeanAnnualizedTurnover=("annualized_turnover", "mean"),
+        )
+        turnover_text = (
+            "MA turnover comes from regime switches plus the initial OOS allocation. "
+            "Static blends are modeled as buy-and-hold with no periodic rebalance, so they only incur initial allocation cost."
+        )
+    else:
+        ma_turnover = pd.DataFrame()
+        static_turnover = pd.DataFrame()
+
+    show_cols = [
+        "slice",
+        "strategy",
+        "scenario",
+        "cost_bps",
+        "execution_delay_days",
+        "CAGR",
+        "MaxDD",
+        "Calmar",
+        "Final_Equity",
+        "total_turnover",
+        "annualized_turnover",
+        "trade_days",
+        "final_cost_drag",
+    ]
+    show = results[show_cols].copy() if not results.empty else pd.DataFrame()
+    if not show.empty:
+        for col in ["CAGR", "MaxDD", "final_cost_drag"]:
+            show[col] = show[col].map(_fmt_pct)
+        for col in ["Calmar", "Final_Equity", "total_turnover", "annualized_turnover", "trade_days"]:
+            show[col] = show[col].map(_fmt_num)
+
+    ma_base_show = ma_base[
+        ["slice", "CAGR", "MaxDD", "Calmar", "Final_Equity", "total_turnover", "trade_days"]
+    ].copy() if not ma_base.empty else pd.DataFrame()
+    if not ma_base_show.empty:
+        for col in ["CAGR", "MaxDD"]:
+            ma_base_show[col] = ma_base_show[col].map(_fmt_pct)
+        for col in ["Calmar", "Final_Equity", "total_turnover", "trade_days"]:
+            ma_base_show[col] = ma_base_show[col].map(_fmt_num)
+
+    if not ma_turnover.empty:
+        ma_turnover_show = ma_turnover.copy()
+        ma_turnover_show["MeanAnnualizedTurnover"] = ma_turnover_show["MeanAnnualizedTurnover"].map(_fmt_num)
+        ma_turnover_show["MeanTradeDays"] = ma_turnover_show["MeanTradeDays"].map(_fmt_num)
+        ma_turnover_show["MeanCostDrag"] = ma_turnover_show["MeanCostDrag"].map(_fmt_pct)
+    else:
+        ma_turnover_show = ma_turnover
+
+    if not static_turnover.empty:
+        static_turnover_show = static_turnover.copy()
+        static_turnover_show["MeanTradeDays"] = static_turnover_show["MeanTradeDays"].map(_fmt_num)
+        static_turnover_show["MeanAnnualizedTurnover"] = static_turnover_show["MeanAnnualizedTurnover"].map(_fmt_num)
+    else:
+        static_turnover_show = static_turnover
+
+    lines = [
+        "# Cost Stress Audit for MA150 Risk-Off QQQ",
+        "",
+        "## Executive Verdict",
+        "",
+        verdict,
+        "",
+        "Current decision: HOLD. Paper-trading status: NOT READY FOR PAPER TRADING.",
+        "",
+        "## Execution Assumptions",
+        "",
+        "- Costs are one-way transaction costs applied only to changes in TQQQ and QQQ weights.",
+        "- Costs are not applied to buy-and-hold daily returns and do not double-count TQQQ fund expense.",
+        "- Static blends are buy-and-hold; no periodic rebalance is modeled, so they only incur initial OOS allocation cost.",
+        "- One-day execution delay shifts already-lagged strategy weights by one more trading day; day t close signal can affect returns no earlier than day t+2.",
+        "",
+        "## MA150 Base Case",
+        "",
+        _markdown_table(ma_base_show),
+        "",
+        "## Cost Hurdles",
+        "",
+        *scenario_lines,
+        "",
+        "## Execution Delay Stress",
+        "",
+        *delay_lines,
+        "",
+        "## Turnover Attribution",
+        "",
+        turnover_text,
+        "",
+        "### MA150 Turnover By Scenario",
+        "",
+        _markdown_table(ma_turnover_show),
+        "",
+        "### Static Strategy Turnover",
+        "",
+        _markdown_table(static_turnover_show),
+        "",
+        "## Interpretation",
+        "",
+        "- If MA150 loses to simple blends after moderate costs, its research value should be reduced.",
+        "- If one-day execution delay materially worsens results, implementation timing risk is a blocker.",
+        "- Cost drag is mainly a function of switch frequency and whether the strategy moves between TQQQ and QQQ or cash.",
+        "- This audit is not paper-trading approval; it is a hurdle check for continued research.",
+        "",
+        "## Full Summary",
+        "",
+        _markdown_table(show),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def write_cost_stress_outputs(results: pd.DataFrame, out_prefix: str) -> tuple[Path, Path]:
+    out_dir = Path(out_prefix).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "cost_stress_summary.csv"
+    report_path = out_dir / "COST_STRESS_AUDIT.md"
+    results.to_csv(csv_path, index=False)
+    report_path.write_text(build_cost_stress_report(results), encoding="utf-8")
+    return csv_path, report_path
+
+
 def write_outputs(summary: pd.DataFrame, out_prefix: str) -> tuple[Path, Path]:
     prefix = Path(out_prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -1573,6 +1970,9 @@ def parse_args(argv=None):
     ap.add_argument("--underwater_pain_audit", action="store_true")
     ap.add_argument("--save_daily_artifacts", action="store_true")
     ap.add_argument("--artifact_dir", default="reports/minimal_baseline/raw")
+    ap.add_argument("--cost_stress_audit", action="store_true")
+    ap.add_argument("--cost_bps_list", default="0,5,10,25,50")
+    ap.add_argument("--execution_delay_days", type=int, default=0)
     return ap.parse_args(argv)
 
 
@@ -1605,6 +2005,16 @@ def main(argv=None) -> int:
     if args.save_daily_artifacts:
         artifact_paths = save_daily_artifacts(df, slices, artifact_dir=args.artifact_dir)
         print(f"[minimal] wrote {len(artifact_paths)} daily artifact files to {args.artifact_dir}")
+    if args.cost_stress_audit:
+        cost_results = run_cost_stress_suite(
+            df,
+            slices,
+            cost_bps_list=args.cost_bps_list,
+            execution_delay_days=args.execution_delay_days,
+        )
+        cost_csv, cost_report = write_cost_stress_outputs(cost_results, args.out_prefix)
+        print(f"[minimal] wrote {cost_csv}")
+        print(f"[minimal] wrote {cost_report}")
     return 0
 
 
