@@ -89,6 +89,10 @@ Thumbs.db
 # Raw strict audit walk-forward outputs are reproducible artifacts.
 reports/strict_audit/*_strict_walk_forward.csv
 
+# Raw minimal baseline daily artifacts are reproducible and can be large.
+reports/minimal_baseline/raw/
+reports/minimal_baseline/*_daily_*.csv
+
 secrets/
 credentials/
 cookies/

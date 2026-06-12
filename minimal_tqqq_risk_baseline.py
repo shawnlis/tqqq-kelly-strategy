@@ -858,6 +858,97 @@ def run_underwater_pain_audit(df: pd.DataFrame, strict_slices: Iterable[dict] | 
     return out
 
 
+def _slug(text: str) -> str:
+    chars = []
+    for ch in str(text).lower():
+        if ch.isalnum():
+            chars.append(ch)
+        else:
+            chars.append("_")
+    slug = "_".join(part for part in "".join(chars).split("_") if part)
+    return slug or "item"
+
+
+def _daily_artifact_specs() -> list[tuple[str, str, callable]]:
+    return [
+        ("TQQQ buy-and-hold", "raw_tqqq", lambda d: run_static_blend_backtest(d, 1.0, 0.0, 0.0)),
+        ("70/30 TQQQ/QQQ", "static_blend", lambda d: run_static_blend_backtest(d, 0.7, 0.3, 0.0)),
+        ("50/50 TQQQ/QQQ", "static_blend", lambda d: run_static_blend_backtest(d, 0.5, 0.5, 0.0)),
+        (
+            "MA150 risk-off QQQ",
+            "ma_regime",
+            lambda d: run_ma_regime_backtest(d, {"ma_window": 150, "risk_off_asset": "qqq", "confirmation_days": 1}),
+        ),
+    ]
+
+
+def _daily_artifact_frame(result: dict, df_slice: pd.DataFrame, sl: dict, label: str, family: str, run_id: str) -> pd.DataFrame:
+    test_start = pd.Timestamp(sl["test_start"])
+    test_end = min(pd.Timestamp(sl["test_end"]), pd.Timestamp(df_slice.index.max()))
+    oos_index = df_slice.loc[(df_slice.index >= test_start) & (df_slice.index <= test_end)].index
+    weights = result["weights"].reindex(oos_index).copy()
+    equity = _normalize(result["equity"].reindex(oos_index)).rename("equity")
+    benchmark = _normalize(result["benchmark_equity"].reindex(oos_index)).rename("tqqq_buyhold_equity")
+    ret = _price_returns(df_slice).reindex(oos_index).fillna(0.0)
+    daily = result["daily_returns"].reindex(oos_index).fillna(0.0).rename("strategy_daily_return")
+    out = pd.DataFrame(index=oos_index)
+    out.index.name = "Date"
+    out["run_id"] = str(run_id)
+    out["slice"] = str(sl["slice"])
+    out["strategy"] = str(label)
+    out["family"] = str(family)
+    out["train_start"] = str(sl["train_start"])
+    out["train_end"] = str(sl["train_end"])
+    out["test_start"] = str(sl["test_start"])
+    out["test_end"] = test_end.strftime("%Y-%m-%d")
+    out["QQQ"] = df_slice["QQQ"].reindex(oos_index)
+    out["TQQQ"] = df_slice["TQQQ"].reindex(oos_index)
+    out["qqq_return"] = ret["QQQ"]
+    out["tqqq_return"] = ret["TQQQ"]
+    out["strategy_daily_return"] = daily
+    out["equity"] = equity
+    out["tqqq_buyhold_equity"] = benchmark
+    out["drawdown"] = equity / equity.cummax() - 1.0
+    out["tqqq_buyhold_drawdown"] = benchmark / benchmark.cummax() - 1.0
+    for col in ["w_tqqq", "w_qqq", "w_cash", "effective_leverage"]:
+        out[col] = weights[col] if col in weights else np.nan
+    out["signal_state"] = np.where(out["w_tqqq"].fillna(0.0) > 0.5, "risk_on", "risk_off")
+    out["raw_signal"] = weights["raw_signal"] if "raw_signal" in weights else np.nan
+    out["signal_lagged"] = weights["signal_lagged"] if "signal_lagged" in weights else np.nan
+    out["qqq_drawdown"] = df_slice["QQQ"].reindex(oos_index) / df_slice["QQQ"].reindex(oos_index).cummax() - 1.0
+    return out
+
+
+def save_daily_artifacts(
+    df: pd.DataFrame,
+    strict_slices: Iterable[dict] | None = None,
+    artifact_dir: str | Path = "reports/minimal_baseline/raw",
+    run_id: str = "minimal_v01",
+) -> list[Path]:
+    """Save explicit daily OOS artifacts for fixed minimal comparison strategies."""
+    px = _require_price_frame(df)
+    slices = list(strict_slices or default_strict_slices(px))
+    out_dir = Path(artifact_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for sl in slices:
+        train_start = pd.Timestamp(sl["train_start"])
+        test_end = min(pd.Timestamp(sl["test_end"]), pd.Timestamp(px.index.max()))
+        df_slice = px.loc[(px.index >= train_start) & (px.index <= test_end)].copy()
+        if df_slice.empty:
+            continue
+        for label, family, fn in _daily_artifact_specs():
+            result = fn(df_slice)
+            artifact = _daily_artifact_frame(result, df_slice, sl, label, family, str(run_id))
+            if artifact.empty:
+                continue
+            filename = f"{_slug(run_id)}_{_slug(sl['slice'])}_{_slug(label)}_daily_artifacts.csv"
+            path = out_dir / filename
+            artifact.to_csv(path)
+            paths.append(path)
+    return paths
+
+
 def _read_price_csv(path: str, name: str) -> pd.Series:
     src = pd.read_csv(path, parse_dates=["Date"]).set_index("Date")
     col = "Adj Close" if "Adj Close" in src.columns else "Close"
@@ -1480,6 +1571,8 @@ def parse_args(argv=None):
     ap.add_argument("--out_prefix", default="reports/minimal_baseline/minimal_tqqq")
     ap.add_argument("--ma_behavior_audit", action="store_true")
     ap.add_argument("--underwater_pain_audit", action="store_true")
+    ap.add_argument("--save_daily_artifacts", action="store_true")
+    ap.add_argument("--artifact_dir", default="reports/minimal_baseline/raw")
     return ap.parse_args(argv)
 
 
@@ -1509,6 +1602,9 @@ def main(argv=None) -> int:
         pain_csv, pain_report = write_underwater_pain_outputs(pain_results, args.out_prefix)
         print(f"[minimal] wrote {pain_csv}")
         print(f"[minimal] wrote {pain_report}")
+    if args.save_daily_artifacts:
+        artifact_paths = save_daily_artifacts(df, slices, artifact_dir=args.artifact_dir)
+        print(f"[minimal] wrote {len(artifact_paths)} daily artifact files to {args.artifact_dir}")
     return 0
 
 
