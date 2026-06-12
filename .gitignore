@@ -93,6 +93,11 @@ reports/strict_audit/*_strict_walk_forward.csv
 reports/minimal_baseline/raw/
 reports/minimal_baseline/*_daily_*.csv
 
+# Local frozen monitor automation material.
+logs/
+automation/*.ps1
+!automation/*.ps1.template
+
 secrets/
 credentials/
 cookies/

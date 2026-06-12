@@ -1,0 +1,38 @@
+param(
+    [string]$TaskName = "TQQQ Frozen MA150 Monitor",
+    [string]$RunTime = "06:45",
+    [switch]$EnableAfterCreate
+)
+
+$ErrorActionPreference = "Stop"
+
+$RepoRoot = "C:\Strategies\TQQQ Kelly"
+$RunnerPath = Join-Path $RepoRoot "automation\run_frozen_monitor.ps1"
+
+if (-not (Test-Path -LiteralPath $RunnerPath)) {
+    throw "Create automation\run_frozen_monitor.ps1 from the template before registering the task."
+}
+
+$Action = New-ScheduledTaskAction `
+    -Execute "powershell.exe" `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$RunnerPath`""
+
+$Trigger = New-ScheduledTaskTrigger -Daily -At $RunTime
+$Settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew
+
+Register-ScheduledTask `
+    -TaskName $TaskName `
+    -Action $Action `
+    -Trigger $Trigger `
+    -Settings $Settings `
+    -Description "Read-only frozen MA150 monitor. Default run time is Singapore 06:45." `
+    -Force | Out-Null
+
+if ($EnableAfterCreate) {
+    Enable-ScheduledTask -TaskName $TaskName | Out-Null
+    Write-Host "Task registered and enabled: $TaskName"
+} else {
+    Disable-ScheduledTask -TaskName $TaskName | Out-Null
+    Write-Host "Task registered but disabled: $TaskName"
+    Write-Host "Review the runner and enable manually only when ready."
+}
