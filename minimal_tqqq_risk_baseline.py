@@ -2488,6 +2488,125 @@ def write_frozen_monitor_outputs(monitor: dict, monitor_out: str | Path) -> tupl
     return spec_path, report_path, json_path
 
 
+MONITOR_HISTORY_COLUMNS = [
+    "run_timestamp_local",
+    "asof_date",
+    "qqq_close",
+    "ma150",
+    "distance_to_ma_pct",
+    "signal_state",
+    "target_asset_next_session",
+    "previous_signal_state",
+    "signal_changed",
+    "last_switch_date",
+    "days_since_last_switch",
+    "decision_status",
+    "paper_trading_status",
+    "rule_name",
+    "monitoring_only",
+]
+
+
+def monitor_history_row(monitor: dict, run_timestamp_local: str | None = None) -> dict:
+    return {
+        "run_timestamp_local": run_timestamp_local or pd.Timestamp.now().isoformat(timespec="seconds"),
+        "asof_date": monitor["asof_date"],
+        "qqq_close": monitor["latest_close"],
+        "ma150": monitor["ma150"],
+        "distance_to_ma_pct": monitor["distance_to_ma_pct"],
+        "signal_state": monitor["signal_state"],
+        "target_asset_next_session": monitor["target_asset_next_session"],
+        "previous_signal_state": monitor["previous_signal_state"],
+        "signal_changed": bool(monitor["signal_changed"]),
+        "last_switch_date": monitor["last_switch_date"],
+        "days_since_last_switch": monitor["days_since_last_switch"],
+        "decision_status": monitor["decision_status"],
+        "paper_trading_status": monitor["paper_trading_status"],
+        "rule_name": monitor["rule_name"],
+        "monitoring_only": True,
+    }
+
+
+def append_monitor_history(
+    monitor: dict,
+    history_csv: str | Path = "reports/minimal_baseline/frozen_monitor_history.csv",
+    allow_duplicate: bool = False,
+    run_timestamp_local: str | None = None,
+) -> tuple[Path, bool]:
+    """Append a monitoring-only history row.
+
+    The history intentionally excludes account, broker, order, shares, and
+    notional fields. It is not an order log and must not be used as one.
+    """
+    path = Path(history_csv)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = monitor_history_row(monitor, run_timestamp_local=run_timestamp_local)
+
+    if path.exists():
+        existing = pd.read_csv(path)
+        if "asof_date" in existing.columns and not allow_duplicate:
+            if str(row["asof_date"]) in set(existing["asof_date"].astype(str)):
+                return path, False
+        out = pd.concat([existing, pd.DataFrame([row])], ignore_index=True)
+    else:
+        out = pd.DataFrame([row])
+
+    for col in MONITOR_HISTORY_COLUMNS:
+        if col not in out.columns:
+            out[col] = np.nan
+    out = out[MONITOR_HISTORY_COLUMNS]
+    out.to_csv(path, index=False)
+    return path, True
+
+
+def build_monitor_review_playbook() -> str:
+    lines = [
+        "# Frozen Monitor Review Playbook",
+        "",
+        "## Scope",
+        "",
+        "- The monitor is read-only and monitoring only.",
+        "- It is not a trade recommendation.",
+        "- It is not paper trading.",
+        "- It does not connect to brokers, read accounts, generate orders, or suggest position size.",
+        "- Signal is generated after the close and is only meaningful for the next trading session.",
+        "- Current status remains HOLD / NOT READY FOR PAPER TRADING.",
+        "",
+        "## Required Review When signal_changed=True",
+        "",
+        "1. Confirm the data date is correct.",
+        "2. Confirm QQQ close is credible against an independent market-data source.",
+        "3. Confirm MA150 is reasonable and based only on available close data.",
+        "4. Check for missing data, holidays, partial sessions, or stale prices.",
+        "5. Confirm the strategy still satisfies the go/no-go hurdles.",
+        "6. Confirm the project remains HOLD / NOT READY.",
+        "",
+        "## Prohibited Actions",
+        "",
+        "- Do not automatically place orders.",
+        "- Do not read account data.",
+        "- Do not change the rule.",
+        "- Do not enter live or paper trading based on a single signal.",
+        "- Do not treat monitor target as a trade instruction.",
+        "- Do not add broker, shares, notional, account, or order fields to monitor history.",
+        "",
+        "## Record Discipline",
+        "",
+        "- History rows are signal observations, not trades.",
+        "- Duplicate as-of dates are skipped by default.",
+        "- Use duplicate rows only when explicitly documenting a rerun or data correction.",
+        "- Any future paper-trading approval must be documented outside this monitor.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def write_monitor_review_playbook(out_dir: str | Path = "reports/minimal_baseline") -> Path:
+    path = Path(out_dir) / "MONITOR_REVIEW_PLAYBOOK.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(build_monitor_review_playbook(), encoding="utf-8")
+    return path
+
+
 def write_outputs(summary: pd.DataFrame, out_prefix: str) -> tuple[Path, Path]:
     prefix = Path(out_prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -2517,6 +2636,9 @@ def parse_args(argv=None):
     ap.add_argument("--frozen_monitor", action="store_true")
     ap.add_argument("--monitor_asof", default=None)
     ap.add_argument("--monitor_out", default="reports/minimal_baseline/frozen_monitor_latest.md")
+    ap.add_argument("--append_monitor_history", action="store_true")
+    ap.add_argument("--monitor_history_csv", default="reports/minimal_baseline/frozen_monitor_history.csv")
+    ap.add_argument("--allow_duplicate_monitor_history", action="store_true")
     return ap.parse_args(argv)
 
 
@@ -2538,9 +2660,19 @@ def main(argv=None) -> int:
     if monitor_only:
         monitor = generate_frozen_ma150_monitor(df, asof_date=args.monitor_asof)
         spec_path, monitor_path, json_path = write_frozen_monitor_outputs(monitor, args.monitor_out)
+        playbook_path = write_monitor_review_playbook(Path(args.monitor_out).parent)
         print(f"[minimal] wrote {spec_path}")
         print(f"[minimal] wrote {monitor_path}")
         print(f"[minimal] wrote {json_path}")
+        print(f"[minimal] wrote {playbook_path}")
+        if args.append_monitor_history:
+            history_path, appended = append_monitor_history(
+                monitor,
+                history_csv=args.monitor_history_csv,
+                allow_duplicate=args.allow_duplicate_monitor_history,
+            )
+            action = "appended" if appended else "skipped duplicate"
+            print(f"[minimal] {action} monitor history: {history_path}")
         print(f"[minimal] frozen monitor target next session: {monitor['target_asset_next_session']}")
         return 0
 
@@ -2588,9 +2720,19 @@ def main(argv=None) -> int:
     if args.frozen_monitor:
         monitor = generate_frozen_ma150_monitor(df, asof_date=args.monitor_asof)
         spec_path, monitor_path, json_path = write_frozen_monitor_outputs(monitor, args.monitor_out)
+        playbook_path = write_monitor_review_playbook(Path(args.monitor_out).parent)
         print(f"[minimal] wrote {spec_path}")
         print(f"[minimal] wrote {monitor_path}")
         print(f"[minimal] wrote {json_path}")
+        print(f"[minimal] wrote {playbook_path}")
+        if args.append_monitor_history:
+            history_path, appended = append_monitor_history(
+                monitor,
+                history_csv=args.monitor_history_csv,
+                allow_duplicate=args.allow_duplicate_monitor_history,
+            )
+            action = "appended" if appended else "skipped duplicate"
+            print(f"[minimal] {action} monitor history: {history_path}")
         print(f"[minimal] frozen monitor target next session: {monitor['target_asset_next_session']}")
     return 0
 

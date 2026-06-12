@@ -1,0 +1,2 @@
+run_timestamp_local,asof_date,qqq_close,ma150,distance_to_ma_pct,signal_state,target_asset_next_session,previous_signal_state,signal_changed,last_switch_date,days_since_last_switch,decision_status,paper_trading_status,rule_name,monitoring_only
+2026-06-12T19:14:39,2026-06-11,717.1199951171875,632.5651298014322,0.1336698172760451,risk_on,TQQQ,risk_on,False,2026-04-08,45,HOLD,NOT_READY,Frozen MA150 risk-off QQQ,True
