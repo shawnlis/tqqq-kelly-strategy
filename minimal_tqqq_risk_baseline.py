@@ -111,6 +111,34 @@ def _result_from_weights(df: pd.DataFrame, weights: pd.DataFrame, strategy: str)
     }
 
 
+def _confirmed_ma_signal(price: pd.Series, ma: pd.Series, confirmation_days: int = 1) -> pd.Series:
+    """Close-only MA regime target, optionally requiring consecutive confirmations."""
+    confirmation_days = int(confirmation_days)
+    if confirmation_days < 1:
+        raise ValueError("confirmation_days must be >= 1.")
+    above = (price > ma).fillna(False)
+    if confirmation_days == 1:
+        return above.astype(float)
+
+    state = False
+    above_count = 0
+    below_count = 0
+    out = []
+    for is_above in above.astype(bool):
+        if is_above:
+            above_count += 1
+            below_count = 0
+        else:
+            below_count += 1
+            above_count = 0
+        if not state and above_count >= confirmation_days:
+            state = True
+        elif state and below_count >= confirmation_days:
+            state = False
+        out.append(1.0 if state else 0.0)
+    return pd.Series(out, index=price.index, dtype=float)
+
+
 def run_static_blend_backtest(
     df: pd.DataFrame,
     tqqq_weight: float,
@@ -143,19 +171,23 @@ def run_ma_regime_backtest(df: pd.DataFrame, fast_or_slow_config=None) -> dict:
     cfg = dict(fast_or_slow_config or {})
     ma_window = int(cfg.get("ma_window", cfg.get("slow_window", 200)))
     risk_off_asset = str(cfg.get("risk_off_asset", "cash")).lower()
+    confirmation_days = int(cfg.get("confirmation_days", 1))
     if risk_off_asset not in {"cash", "qqq"}:
         raise ValueError("risk_off_asset must be 'cash' or 'qqq'.")
     px = _require_price_frame(df)
     ma = px["QQQ"].rolling(ma_window).mean()
-    raw_signal = (px["QQQ"] > ma).astype(float)
+    raw_signal = _confirmed_ma_signal(px["QQQ"], ma, confirmation_days)
     risk_on_for_pnl = raw_signal.shift(1).fillna(0.0)
     w_tqqq = risk_on_for_pnl
     w_qqq = (1.0 - risk_on_for_pnl) if risk_off_asset == "qqq" else 0.0
     w_cash = 1.0 - w_tqqq - (w_qqq if isinstance(w_qqq, pd.Series) else 0.0)
     strategy = f"ma_regime_qqq_ma{ma_window}_riskoff_{risk_off_asset}"
+    if confirmation_days > 1:
+        strategy = f"{strategy}_confirm{confirmation_days}d"
     weights = _weights_frame(px.index, w_tqqq, w_qqq, w_cash, strategy)
     weights["raw_signal"] = raw_signal
     weights["signal_lagged"] = risk_on_for_pnl
+    weights["confirmation_days"] = confirmation_days
     return _result_from_weights(px, weights, strategy)
 
 
@@ -387,6 +419,204 @@ def run_minimal_baseline_suite(df: pd.DataFrame, strict_slices: Iterable[dict] |
     return out
 
 
+def _ma_variant_specs() -> list[tuple[str, dict]]:
+    return [
+        ("MA200 risk-off QQQ", {"ma_window": 200, "risk_off_asset": "qqq", "confirmation_days": 1}),
+        ("MA200 risk-off cash", {"ma_window": 200, "risk_off_asset": "cash", "confirmation_days": 1}),
+        ("MA150 risk-off QQQ", {"ma_window": 150, "risk_off_asset": "qqq", "confirmation_days": 1}),
+        ("MA250 risk-off QQQ", {"ma_window": 250, "risk_off_asset": "qqq", "confirmation_days": 1}),
+        (
+            "MA200 risk-off QQQ with 5-day confirmation",
+            {"ma_window": 200, "risk_off_asset": "qqq", "confirmation_days": 5},
+        ),
+    ]
+
+
+def _average_run_length(mask: pd.Series, value: bool) -> float:
+    ser = pd.Series(mask).dropna().astype(bool)
+    if ser.empty:
+        return float("nan")
+    runs = []
+    current_value = bool(ser.iloc[0])
+    current_len = 1
+    for item in ser.iloc[1:]:
+        item = bool(item)
+        if item == current_value:
+            current_len += 1
+        else:
+            if current_value == value:
+                runs.append(current_len)
+            current_value = item
+            current_len = 1
+    if current_value == value:
+        runs.append(current_len)
+    return float(np.mean(runs)) if runs else 0.0
+
+
+def _monthly_active_extremes(strategy_returns: pd.Series, tqqq_returns: pd.Series) -> dict:
+    aligned = pd.concat(
+        [strategy_returns.rename("strategy"), tqqq_returns.rename("tqqq")],
+        axis=1,
+    ).dropna()
+    if aligned.empty:
+        return {
+            "worst_missed_up_month": "",
+            "worst_missed_up_month_gap": float("nan"),
+            "best_avoided_down_month": "",
+            "best_avoided_down_month_gain": float("nan"),
+        }
+    period = aligned.index.to_period("M")
+    monthly = (1.0 + aligned).groupby(period).prod() - 1.0
+    monthly["active"] = monthly["strategy"] - monthly["tqqq"]
+
+    up = monthly[monthly["tqqq"] > 0.0]
+    if up.empty:
+        missed_month = ""
+        missed_gap = float("nan")
+    else:
+        missed_idx = up["active"].idxmin()
+        missed_month = str(missed_idx)
+        missed_gap = float(up.loc[missed_idx, "active"])
+
+    down = monthly[monthly["tqqq"] < 0.0]
+    if down.empty:
+        avoided_month = ""
+        avoided_gain = float("nan")
+    else:
+        avoided_idx = down["active"].idxmax()
+        avoided_month = str(avoided_idx)
+        avoided_gain = float(down.loc[avoided_idx, "active"])
+
+    return {
+        "worst_missed_up_month": missed_month,
+        "worst_missed_up_month_gap": missed_gap,
+        "best_avoided_down_month": avoided_month,
+        "best_avoided_down_month_gain": avoided_gain,
+    }
+
+
+def _ma_behavior_stats(result: dict, sl: dict, df_slice: pd.DataFrame) -> dict:
+    test_start = pd.Timestamp(sl["test_start"])
+    test_end = min(pd.Timestamp(sl["test_end"]), pd.Timestamp(df_slice.index.max()))
+    oos_index = df_slice.loc[(df_slice.index >= test_start) & (df_slice.index <= test_end)].index
+    weights_oos = result["weights"].reindex(oos_index).dropna(how="all")
+    if weights_oos.empty:
+        return {
+            "time_in_risk_on": float("nan"),
+            "time_in_risk_off": float("nan"),
+            "switches_per_year": float("nan"),
+            "avg_days_in_risk_on": float("nan"),
+            "avg_days_in_risk_off": float("nan"),
+            "worst_missed_up_month": "",
+            "worst_missed_up_month_gap": float("nan"),
+            "best_avoided_down_month": "",
+            "best_avoided_down_month_gain": float("nan"),
+        }
+
+    risk_on = weights_oos["w_tqqq"].astype(float) > 0.5
+    switches = float(risk_on.astype(int).diff().abs().fillna(0.0).sum())
+    years = max(len(weights_oos) / PERIODS_PER_YEAR, 1e-12)
+    ret = _price_returns(df_slice).reindex(oos_index).fillna(0.0)
+    strategy_ret = result["daily_returns"].reindex(oos_index).fillna(0.0)
+    extremes = _monthly_active_extremes(strategy_ret, ret["TQQQ"])
+    return {
+        "time_in_risk_on": float(risk_on.mean()),
+        "time_in_risk_off": float((~risk_on).mean()),
+        "switches_per_year": switches / years,
+        "avg_days_in_risk_on": _average_run_length(risk_on, True),
+        "avg_days_in_risk_off": _average_run_length(risk_on, False),
+        **extremes,
+    }
+
+
+def run_ma_regime_variants(df: pd.DataFrame, strict_slices: Iterable[dict] | None = None) -> pd.DataFrame:
+    """Run the fixed, pre-declared MA regime variants on strict OOS slices."""
+    px = _require_price_frame(df)
+    slices = list(strict_slices or default_strict_slices(px))
+    rows = []
+    for sl in slices:
+        train_start = pd.Timestamp(sl["train_start"])
+        test_end = min(pd.Timestamp(sl["test_end"]), pd.Timestamp(px.index.max()))
+        df_slice = px.loc[(px.index >= train_start) & (px.index <= test_end)].copy()
+        if df_slice.empty:
+            continue
+        for label, cfg in _ma_variant_specs():
+            result = run_ma_regime_backtest(df_slice, cfg)
+            row = _slice_result_to_row(result, label, "ma_regime_variant", sl, df_slice)
+            row.update(
+                {
+                    "ma_window": int(cfg["ma_window"]),
+                    "risk_off_asset": str(cfg["risk_off_asset"]),
+                    "confirmation_days": int(cfg["confirmation_days"]),
+                }
+            )
+            row.update(_ma_behavior_stats(result, sl, df_slice))
+            rows.append(row)
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out["Rank_Calmar_In_Slice"] = out.groupby("slice")["Calmar"].rank(method="min", ascending=False)
+        out["Rank_Sharpe_In_Slice"] = out.groupby("slice")["Sharpe_DailyExcess"].rank(method="min", ascending=False)
+        out["Rank_CAGR_In_Slice"] = out.groupby("slice")["CAGR"].rank(method="min", ascending=False)
+        out["Rank_MaxDD_In_Slice"] = out.groupby("slice")["MaxDD"].rank(method="min", ascending=False)
+    return out
+
+
+def _best_ma_variant(summary: pd.DataFrame) -> tuple[str, pd.DataFrame]:
+    ranked = summary.copy()
+    ranked["CompositeRank"] = (
+        ranked["Rank_Calmar_In_Slice"]
+        + ranked["Rank_Sharpe_In_Slice"]
+        + ranked["Rank_MaxDD_In_Slice"]
+        + 0.5 * ranked["Rank_CAGR_In_Slice"]
+    )
+    agg = ranked.groupby("strategy", as_index=False).agg(
+        MeanCompositeRank=("CompositeRank", "mean"),
+        MeanCalmar=("Calmar", "mean"),
+        MeanSharpe=("Sharpe_DailyExcess", "mean"),
+        MeanCAGR=("CAGR", "mean"),
+        WorstMaxDD=("MaxDD", "min"),
+        MeanRiskOn=("time_in_risk_on", "mean"),
+        MeanSwitchesPerYear=("switches_per_year", "mean"),
+        Slices=("slice", "nunique"),
+    )
+    agg = agg.sort_values(["MeanCompositeRank", "MeanCalmar"], ascending=[True, False])
+    return str(agg.iloc[0]["strategy"]), agg
+
+
+def analyze_ma_regime_behavior(df: pd.DataFrame, results: pd.DataFrame) -> dict:
+    """Return a compact, evidence-first interpretation of the MA variant audit."""
+    if results.empty:
+        return {
+            "best_variant": "",
+            "worth_research": False,
+            "paper_trading_ready": False,
+            "summary": "No MA variant results were available.",
+        }
+    best_variant, agg = _best_ma_variant(results)
+    best = results[results["strategy"] == best_variant]
+    beats_tqqq_cagr = int((best["CAGR"] >= best["Benchmark_TQQQ_CAGR"]).sum())
+    lowers_dd = int((best["MaxDD"] > best["Benchmark_TQQQ_MaxDD"]).sum())
+    improves_calmar = int((best["Calmar"] > best["Benchmark_TQQQ_Calmar"]).sum())
+    slices = int(best["slice"].nunique())
+    worth_research = improves_calmar > 0 or lowers_dd > 0
+    paper_ready = beats_tqqq_cagr == slices and lowers_dd == slices and improves_calmar == slices
+    return {
+        "best_variant": best_variant,
+        "variant_ranking": agg,
+        "beats_tqqq_cagr_slices": beats_tqqq_cagr,
+        "lowers_tqqq_drawdown_slices": lowers_dd,
+        "improves_tqqq_calmar_slices": improves_calmar,
+        "slices": slices,
+        "worth_research": bool(worth_research),
+        "paper_trading_ready": bool(paper_ready),
+        "summary": (
+            f"{best_variant} beat TQQQ CAGR in {beats_tqqq_cagr}/{slices} slices, "
+            f"had lower drawdown in {lowers_dd}/{slices}, and improved Calmar in "
+            f"{improves_calmar}/{slices}."
+        ),
+    }
+
+
 def _read_price_csv(path: str, name: str) -> pd.Series:
     src = pd.read_csv(path, parse_dates=["Date"]).set_index("Date")
     col = "Adj Close" if "Adj Close" in src.columns else "Close"
@@ -592,6 +822,231 @@ def build_minimal_baseline_report(summary: pd.DataFrame, out_prefix: str) -> str
     return "\n".join(lines) + "\n"
 
 
+def _comparison_wins(left: pd.DataFrame, right: pd.DataFrame, right_label: str) -> str:
+    if left.empty or right.empty:
+        return f"No comparable rows were available for {right_label}."
+    cols = ["slice", "CAGR", "MaxDD", "Calmar", "Sharpe_DailyExcess"]
+    right_cols = [c for c in cols if c in right.columns]
+    if "slice" not in right_cols:
+        return f"No comparable rows were available for {right_label}."
+    merged = left[cols].merge(
+        right[right_cols].rename(
+            columns={
+                "CAGR": "other_cagr",
+                "MaxDD": "other_maxdd",
+                "Calmar": "other_calmar",
+                "Sharpe_DailyExcess": "other_sharpe",
+            }
+        ),
+        on="slice",
+        how="inner",
+    )
+    if merged.empty:
+        return f"No comparable rows were available for {right_label}."
+    cagr = int((merged["CAGR"] > merged["other_cagr"]).sum())
+    maxdd = int((merged["MaxDD"] > merged["other_maxdd"]).sum())
+    calmar = int((merged["Calmar"] > merged["other_calmar"]).sum())
+    sharpe = int((merged["Sharpe_DailyExcess"] > merged["other_sharpe"]).sum())
+    denom = int(len(merged))
+    return (
+        f"Versus {right_label}: CAGR wins {cagr}/{denom}, MaxDD wins {maxdd}/{denom}, "
+        f"Calmar wins {calmar}/{denom}, Sharpe wins {sharpe}/{denom}."
+    )
+
+
+def _strict_baseline_as_metrics() -> pd.DataFrame:
+    path = Path("reports/strict_audit/strict_audit_summary.csv")
+    if not path.exists():
+        return pd.DataFrame()
+    src = pd.read_csv(path)
+    src = src[src.get("mode", pd.Series(dtype=str)) == "baseline"].copy()
+    if src.empty:
+        return src
+    return src.rename(
+        columns={
+            "strategy_cagr": "CAGR",
+            "strategy_maxdd": "MaxDD",
+            "strategy_calmar": "Calmar",
+            "strategy_sharpe_daily_excess": "Sharpe_DailyExcess",
+        }
+    )
+
+
+def build_ma_regime_behavior_report(results: pd.DataFrame, out_dir: Path) -> str:
+    analysis = analyze_ma_regime_behavior(pd.DataFrame(), results)
+    best_name = analysis["best_variant"]
+    best = results[results["strategy"] == best_name].copy() if best_name else pd.DataFrame()
+
+    minimal_path = out_dir / "minimal_tqqq_summary.csv"
+    minimal = pd.read_csv(minimal_path) if minimal_path.exists() else pd.DataFrame()
+    static_7030 = minimal[minimal.get("strategy", pd.Series(dtype=str)) == "Static 70% TQQQ + 30% QQQ"].copy() if not minimal.empty else pd.DataFrame()
+    static_5050 = minimal[minimal.get("strategy", pd.Series(dtype=str)) == "Static 50% TQQQ + 50% QQQ"].copy() if not minimal.empty else pd.DataFrame()
+    current_best = minimal[minimal.get("strategy", pd.Series(dtype=str)) == "MA200 QQQ regime, risk-off QQQ"].copy() if not minimal.empty else pd.DataFrame()
+    complex_baseline = _strict_baseline_as_metrics()
+
+    ranking = analysis.get("variant_ranking", pd.DataFrame())
+    ranking_show = ranking[
+        [
+            "strategy",
+            "MeanCompositeRank",
+            "MeanCalmar",
+            "MeanSharpe",
+            "MeanCAGR",
+            "WorstMaxDD",
+            "MeanRiskOn",
+            "MeanSwitchesPerYear",
+        ]
+    ].copy() if not ranking.empty else pd.DataFrame()
+    for col in ["MeanCAGR", "WorstMaxDD", "MeanRiskOn"]:
+        if col in ranking_show:
+            ranking_show[col] = ranking_show[col].map(_fmt_pct)
+    for col in ["MeanCompositeRank", "MeanCalmar", "MeanSharpe", "MeanSwitchesPerYear"]:
+        if col in ranking_show:
+            ranking_show[col] = ranking_show[col].map(_fmt_num)
+
+    show_cols = [
+        "slice",
+        "strategy",
+        "CAGR",
+        "Benchmark_TQQQ_CAGR",
+        "MaxDD",
+        "Benchmark_TQQQ_MaxDD",
+        "Calmar",
+        "Sharpe_DailyExcess",
+        "Final_Equity",
+        "time_in_risk_on",
+        "switches_per_year",
+        "avg_days_in_risk_on",
+        "avg_days_in_risk_off",
+        "worst_missed_up_month",
+        "worst_missed_up_month_gap",
+        "best_avoided_down_month",
+        "best_avoided_down_month_gain",
+    ]
+    show = results[show_cols].copy()
+    for col in ["CAGR", "Benchmark_TQQQ_CAGR", "MaxDD", "Benchmark_TQQQ_MaxDD", "time_in_risk_on", "worst_missed_up_month_gap", "best_avoided_down_month_gain"]:
+        show[col] = show[col].map(_fmt_pct)
+    for col in ["Calmar", "Sharpe_DailyExcess", "Final_Equity", "switches_per_year", "avg_days_in_risk_on", "avg_days_in_risk_off"]:
+        show[col] = show[col].map(_fmt_num)
+
+    best_show = best[
+        [
+            "slice",
+            "CAGR",
+            "MaxDD",
+            "Calmar",
+            "Sharpe_DailyExcess",
+            "time_in_risk_on",
+            "switches_per_year",
+            "worst_missed_up_month",
+            "best_avoided_down_month",
+        ]
+    ].copy() if not best.empty else pd.DataFrame()
+    if not best_show.empty:
+        for col in ["CAGR", "MaxDD", "time_in_risk_on"]:
+            best_show[col] = best_show[col].map(_fmt_pct)
+        for col in ["Calmar", "Sharpe_DailyExcess", "switches_per_year"]:
+            best_show[col] = best_show[col].map(_fmt_num)
+
+    qqq_vs_cash = "Risk-off QQQ generally preserves rebound participation better than cash, while cash is more defensive during deep drawdowns."
+    if not results.empty:
+        qqq_rows = results[results["strategy"] == "MA200 risk-off QQQ"]
+        cash_rows = results[results["strategy"] == "MA200 risk-off cash"]
+        if not qqq_rows.empty and not cash_rows.empty:
+            qqq_mean = float(qqq_rows["CAGR"].mean())
+            cash_mean = float(cash_rows["CAGR"].mean())
+            qqq_dd = float(qqq_rows["MaxDD"].mean())
+            cash_dd = float(cash_rows["MaxDD"].mean())
+            qqq_vs_cash = (
+                f"Risk-off QQQ had mean CAGR {_fmt_pct(qqq_mean)} and mean MaxDD {_fmt_pct(qqq_dd)}; "
+                f"risk-off cash had mean CAGR {_fmt_pct(cash_mean)} and mean MaxDD {_fmt_pct(cash_dd)}. "
+                "QQQ risk-off keeps equity beta in recoveries; cash risk-off is cleaner defense but can miss rebounds."
+            )
+
+    confirm_text = "The 5-day confirmation is evaluated from consecutive close-only observations and then shifted one day before PnL."
+    confirm_rows = results[results["strategy"] == "MA200 risk-off QQQ with 5-day confirmation"]
+    base_rows = results[results["strategy"] == "MA200 risk-off QQQ"]
+    if not confirm_rows.empty and not base_rows.empty:
+        confirm_switch = float(confirm_rows["switches_per_year"].mean())
+        base_switch = float(base_rows["switches_per_year"].mean())
+        confirm_cagr = float(confirm_rows["CAGR"].mean())
+        base_cagr = float(base_rows["CAGR"].mean())
+        confirm_text = (
+            f"5-day confirmation changed average switches/year from {_fmt_num(base_switch)} to {_fmt_num(confirm_switch)} "
+            f"and mean CAGR from {_fmt_pct(base_cagr)} to {_fmt_pct(confirm_cagr)}. It can reduce whipsaw only if this drop in switch frequency offsets slower re-entry."
+        )
+
+    conclusion = "MA regime is worth continued research as simple trend-following exposure control, but it is not paper-trading ready."
+    if analysis["paper_trading_ready"]:
+        conclusion = "MA regime has unusually strong strict-slice evidence, but this report still does not approve paper trading."
+    elif not analysis["worth_research"]:
+        conclusion = "MA regime did not show enough strict-slice evidence to prioritize further research."
+
+    lines = [
+        "# MA Regime Behavior Audit",
+        "",
+        "## Executive Verdict",
+        "",
+        conclusion,
+        "",
+        f"Best fixed variant: `{best_name}`.",
+        "",
+        "Paper-trading status: NOT READY.",
+        "This is not a TQQQ killer result. It is a simple trend-following exposure-control candidate.",
+        "",
+        "## Best Variant By Slice",
+        "",
+        _markdown_table(best_show),
+        "",
+        "## Variant Ranking",
+        "",
+        _markdown_table(ranking_show),
+        "",
+        "## Behavior Findings",
+        "",
+        f"- {analysis['summary']}",
+        f"- {qqq_vs_cash}",
+        f"- {confirm_text}",
+        "- 2022 defense should be judged by MaxDD, Calmar, and down-month avoidance, not by CAGR alone.",
+        "- 2024-latest recovery behavior should be judged by missed positive months and risk-on time; slow re-entry remains a key risk.",
+        "",
+        "## Comparison Hurdles",
+        "",
+        _comparison_wins(best, static_7030, "70/30 TQQQ/QQQ"),
+        "",
+        _comparison_wins(best, static_5050, "50/50 TQQQ/QQQ"),
+        "",
+        _comparison_wins(best, complex_baseline, "current strict complex baseline"),
+        "",
+        _comparison_wins(best, current_best, "current best minimal baseline"),
+        "",
+        "## Full Variant Summary",
+        "",
+        _markdown_table(show),
+        "",
+        "## Decision",
+        "",
+        "MA regime is worth continued research only as a minimal, explainable risk-management baseline. It does not have paper-trading qualification yet.",
+        "",
+        "## Next Research Questions",
+        "",
+        "1. Does MA regime still beat simple blends after adding retained daily OOS equity and weight artifacts for each slice?",
+        "2. Is the 2024-latest re-entry lag acceptable versus a fixed 70/30 or 50/50 blend?",
+        "3. Does the same MA regime survive a volatility-matched benchmark and tax/slippage stress?",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def write_ma_behavior_outputs(results: pd.DataFrame, out_prefix: str) -> tuple[Path, Path]:
+    out_dir = Path(out_prefix).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "ma_regime_variant_summary.csv"
+    report_path = out_dir / "MA_REGIME_BEHAVIOR_AUDIT.md"
+    results.to_csv(csv_path, index=False)
+    report_path.write_text(build_ma_regime_behavior_report(results, out_dir), encoding="utf-8")
+    return csv_path, report_path
+
+
 def write_outputs(summary: pd.DataFrame, out_prefix: str) -> tuple[Path, Path]:
     prefix = Path(out_prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -610,6 +1065,7 @@ def parse_args(argv=None):
     ap.add_argument("--tqqq_csv", default=None)
     ap.add_argument("--slices_csv", default=None)
     ap.add_argument("--out_prefix", default="reports/minimal_baseline/minimal_tqqq")
+    ap.add_argument("--ma_behavior_audit", action="store_true")
     return ap.parse_args(argv)
 
 
@@ -627,6 +1083,13 @@ def main(argv=None) -> int:
     if not summary.empty:
         best, _ = _best_strategy(summary)
         print(f"[minimal] best composite strategy: {best}")
+    if args.ma_behavior_audit:
+        ma_results = run_ma_regime_variants(df, slices)
+        ma_csv, ma_report = write_ma_behavior_outputs(ma_results, args.out_prefix)
+        analysis = analyze_ma_regime_behavior(df, ma_results)
+        print(f"[minimal] wrote {ma_csv}")
+        print(f"[minimal] wrote {ma_report}")
+        print(f"[minimal] best MA variant: {analysis['best_variant']}")
     return 0
 
 
